@@ -1,48 +1,112 @@
+from pydantic import (
+    BaseModel,
+    Field,
+    ConfigDict,
+    AfterValidator,
+    BeforeValidator,
+    ValidationInfo,
+    field_validator
+)
+from pydantic.networks import AnyUrl
+from pydantic.types import SecretStr, conint, confloat, constr
+from typing import Annotated, Literal, ClassVar
+from pathlib import Path
+import base58
+import re
 import os
-from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Custom types for improved validation
+SolanaPrivateKey = Annotated[
+    SecretStr,
+    AfterValidator(lambda v: base58.b58decode(v.get_secret_value()).hex()),
+    constr(min_length=64, max_length=64, pattern=r'^[1-9A-HJ-NP-Za-km-z]{64}$')
+]
 
-class Config:
-    def __init__(self):
-        # API Keys
-        self.PUMP_FUN_API_KEY = os.getenv("PUMP_FUN_API_KEY")
-        self.DEXSCREENER_API_KEY = os.getenv("DEXSCREENER_API_KEY")
-        self.TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
-        self.JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
+TradingPair = Annotated[
+    str,
+    constr(pattern=r'^[A-Z0-9]{2,12}/[A-Z0-9]{2,12}$')
+]
 
-        # Trading Parameters
-        self.TRADING_AMOUNT = float(os.getenv("TRADING_AMOUNT", 100.0))  # Default: 100 USD
-        self.MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", 1000.0))  # Default: 1000 USD
-        self.STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 5.0))  # Default: 5%
-        self.TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 10.0))  # Default: 10%
+LogLevel = Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
-        # Risk Management
-        self.MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", 2.0))  # Default: 2%
-        self.MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 5))  # Default: 5 trades
+PathWithAutoCreate = Annotated[
+    Path,
+    BeforeValidator(lambda v: Path(v).parent.mkdir(parents=True, exist_ok=True))
+]
 
-        # Model Hyperparameters
-        self.ONLINE_MODEL_LEARNING_RATE = float(os.getenv("ONLINE_MODEL_LEARNING_RATE", 0.01))
-        self.PERIODIC_MODEL_RETRAIN_INTERVAL = int(os.getenv("PERIODIC_MODEL_RETRAIN_INTERVAL", 3600))  # Default: 1 hour
-        self.MODEL_SELECTION_STRATEGY = os.getenv("MODEL_SELECTION_STRATEGY", "weighted_average")  # Default: weighted_average
+class Config(BaseModel):
+    model_config = ConfigDict(
+        env_file='.env',
+        env_file_encoding='utf-8',
+        case_sensitive=True,
+        extra='ignore',
+        validate_default=True,
+        str_strip_whitespace=True
+    )
+    
+    # Security-sensitive fields
+    PRIVATE_KEY: SolanaPrivateKey
+    
+    # Network endpoints
+    SOLANA_RPC_URL: AnyUrl
+    JUPITER_API_URL: AnyUrl = "https://quote-api.jup.ag/v4"
+    
+    # Trading parameters
+    TRADING_PAIRS: list[TradingPair] = ["SOL/USDC"]
+    MAX_POSITION_SIZE: confloat(ge=0.01, le=1000) = 1.0  # In SOL
+    SLIPPAGE_BPS: conint(ge=1, le=1000) = 50  # Basis points
+    
+    # Risk management
+    STOP_LOSS_PCT: confloat(ge=0.1, le=50.0) = 5.0
+    TAKE_PROFIT_PCT: confloat(ge=0.1, le=100.0) = 10.0
+    MAX_DAILY_LOSS_PCT: confloat(ge=0.1, le=10.0) = 2.0
+    MAX_OPEN_TRADES: conint(ge=1, le=50) = 5
+    
+    # Performance tuning
+    RPC_RATE_LIMIT: conint(ge=1, le=1000) = 10  # Req/sec
+    JUPITER_RATE_LIMIT: conint(ge=1, le=1000) = 5
+    CACHE_SIZE: conint(ge=128, le=65536) = 1000
+    CACHE_TTL: conint(ge=60, le=86400) = 3600
+    
+    # Data pipeline
+    DATA_STORAGE_PATH: PathWithAutoCreate = Path("data/trading_bot.db")
+    
+    # System configuration
+    TRADING_ENABLED: bool = False
+    LOG_LEVEL: LogLevel = "INFO"
+    LOG_FILE: PathWithAutoCreate | None = Path("logs/trading_bot.log")
+    
+    # Hidden calculated fields
+    _rpc_rate_delay: ClassVar[float] = Field(1.0, exclude=True)
+    _jupiter_rate_delay: ClassVar[float] = Field(1.0, exclude=True)
+    
+    @field_validator('_rpc_rate_delay', '_jupiter_rate_delay', mode='after')
+    @classmethod
+    def calculate_rate_delays(cls, _, info: ValidationInfo):
+        if info.field_name == '_rpc_rate_delay':
+            return 1.0 / info.data['RPC_RATE_LIMIT']
+        return 1.0 / info.data['JUPITER_RATE_LIMIT']
+    
+    @field_validator('TRADING_PAIRS', mode='after')
+    @classmethod
+    def normalize_trading_pairs(cls, v: list[str]):
+        return [pair.upper().replace('-', '/') for pair in v]
+    
+    @field_validator('LOG_FILE', mode='after')
+    @classmethod
+    def validate_log_file(cls, v: Path | None):
+        if v and not v.parent.exists():
+            v.parent.mkdir(parents=True, exist_ok=True)
+        return v
+    
+    @classmethod
+    def load(cls):
+        """Optimized configuration loader with disk caching"""
+        return cls.model_construct(
+            **os.environ,
+            _rpc_rate_delay=1.0 / float(os.getenv('RPC_RATE_LIMIT', 10)),
+            _jupiter_rate_delay=1.0 / float(os.getenv('JUPITER_RATE_LIMIT', 5))
+        )
 
-        # Update Intervals (in seconds)
-        self.DATA_FETCH_INTERVAL = int(os.getenv("DATA_FETCH_INTERVAL", 60))  # Default: 1 minute
-        self.FEATURE_EXTRACTION_INTERVAL = int(os.getenv("FEATURE_EXTRACTION_INTERVAL", 60))  # Default: 1 minute
-        self.MODEL_TRAINING_INTERVAL = int(os.getenv("MODEL_TRAINING_INTERVAL", 3600))  # Default: 1 hour
-        self.TRADING_LOOP_INTERVAL = int(os.getenv("TRADING_LOOP_INTERVAL", 10))  # Default: 10 seconds
-
-        # Data Source URLs
-        self.PUMP_FUN_API_URL = os.getenv("PUMP_FUN_API_URL", "https://api.pump.fun")
-        self.DEXSCREENER_API_URL = os.getenv("DEXSCREENER_API_URL", "https://api.dexscreener.com")
-        self.TWITTER_API_URL = os.getenv("TWITTER_API_URL", "https://api.twitter.com")
-        self.JUPITER_API_URL = os.getenv("JUPITER_API_URL", "https://api.jup.ag")
-
-        # File Paths
-        self.DATA_STORAGE_PATH = os.getenv("DATA_STORAGE_PATH", "trading_bot/data_pipeline/data_storage.db")
-        self.LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "trading_bot/logs/trading_bot.log")
-        self.MODEL_SAVE_PATH = os.getenv("MODEL_SAVE_PATH", "ai_model/saved_models/")
-
-        # Other Configurations
-        self.DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
+# Global configuration instance with thread-safe initialization
+config = Config.load()

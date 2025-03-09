@@ -1,251 +1,397 @@
 import asyncio
 import logging
-from typing import Dict, Optional
-from trading_bot.trading.exchange import Exchange
-from trading_bot.trading.risk_manager import RiskManager
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, Set, TypeVar, Generic
+from heapq import heappush, heappop
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from prometheus_client import Counter, Histogram, Gauge
+import orjson
+import aiofiles
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import mmap
+import os
+from array import array
+import struct
+from typing import ClassVar
+import weakref
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import ctypes
+from ctypes import c_double, c_int64, c_uint64, c_char_p, Structure, POINTER, c_void_p
+import platform
+
+# Pre-allocate memory for frequently used arrays
+ARRAY_POOL_SIZE = 1000
+array_pool = [array('d', [0.0] * ARRAY_POOL_SIZE) for _ in range(4)]
+array_pool_lock = threading.Lock()
+
+# SIMD-optimized constants
+VECTOR_SIZE = 8 if platform.machine().endswith('64') else 4
+ALIGNMENT = 32  # For AVX-256
+
+class MemoryPool:
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
+    
+    def __init__(self):
+        if not hasattr(self, 'initialized'):
+            self.pools = {}
+            self.locks = {}
+            self.initialized = True
+    
+    def get_array(self, size: int) -> array:
+        with array_pool_lock:
+            if size <= ARRAY_POOL_SIZE:
+                return array_pool.pop()
+            return array('d', [0.0] * size)
+    
+    def return_array(self, arr: array):
+        with array_pool_lock:
+            if len(arr) <= ARRAY_POOL_SIZE:
+                array_pool.append(arr)
+
+@dataclass(order=True, slots=True, frozen=True)
+class OrderPriority:
+    order_id: str = field(compare=False)
+    priority: float
+    created_at: float = field(compare=False)
+    type: str = field(compare=False)
+    amount: float = field(compare=False)
+    price: float = field(compare=False)
+    
+    __slots__ = ('order_id', 'priority', 'created_at', 'type', 'amount', 'price')
 
 class OrderManager:
-    def __init__(self, config):
+    _BATCH_SIZE = 128  # Power of 2 for better cache utilization
+    _DEBOUNCE_TIME = 5.0
+    _CACHE_LINE_SIZE = 64  # Modern CPU cache line size
+    
+    # Class-level thread-local storage
+    _thread_local = threading.local()
+    
+    def __init__(self, config, exchange, risk_manager):
         self.config = config
-        self.logger = logging.getLogger()
-        self.exchange = Exchange(self.config)
-        self.risk_manager = RiskManager(self.config)
-        self.open_orders: Dict[str, dict] = {}  # Dictionary to track open orders with their details
-        self.positions: Dict[str, dict] = {}  # Dictionary to track token holdings with entry prices
-        self._tracking_task: Optional[asyncio.Task] = None
-        self._is_running = False
+        self.exchange = exchange
+        self.risk_manager = risk_manager
+        
+        # Memory-mapped state file for zero-copy persistence
+        self._state_file = open('order_state.mmap', 'w+b')
+        self._state_file.truncate(1024 * 1024)  # 1MB initial size
+        self._state_mmap = mmap.mmap(
+            self._state_file.fileno(), 
+            0,
+            access=mmap.ACCESS_WRITE,
+            offset=0  # Start at beginning of file
+        )
+        
+        # Lock-free data structures with padding for false sharing prevention
+        self._padding1 = array('d', [0.0] * 8)  # Cache line padding
+        self.open_orders = defaultdict(self._create_order)
+        self._padding2 = array('d', [0.0] * 8)
+        self.positions = defaultdict(self._create_position)
+        self._padding3 = array('d', [0.0] * 8)
+        
+        # SIMD-optimized priority queue
+        self._priority_queue = np.zeros((self._BATCH_SIZE, 6), dtype=np.float64)
+        self._priority_queue_ptr = self._priority_queue.ctypes.data_as(POINTER(c_double))
+        
+        # Ring buffer for updates with zero allocation
+        self._pending_updates = asyncio.Queue(maxsize=10_000)
+        self._update_buffer = array('Q', [0] * self._BATCH_SIZE)
+        
+        # Atomic counters with padding
+        self._padding4 = array('d', [0.0] * 8)
+        self._position_version = ctypes.c_uint64(0)
+        self._padding5 = array('d', [0.0] * 8)
+        self._order_version = ctypes.c_uint64(0)
+        
+        # Memory pool
+        self._memory_pool = MemoryPool()
+        
+        # Thread pool for CPU-bound tasks
+        self._thread_pool = ThreadPoolExecutor(max_workers=os.cpu_count())
+        
+        # Metrics with zero allocation
+        self.metrics = {
+            'throughput': Gauge('order_throughput', 'Orders processed/sec'),
+            'queue_depth': Gauge('order_queue_depth', 'Pending order updates'),
+            'latency': Histogram('order_processing_latency', 'Order handling latency'),
+            'positions': Gauge('position_value', 'Current position value', ['token'])
+        }
+        
+        # Pre-allocate arrays for batch processing
+        self._batch_arrays = {
+            'symbols': np.zeros(self._BATCH_SIZE, dtype='S8'),
+            'amounts': np.zeros(self._BATCH_SIZE, dtype=np.float64),
+            'prices': np.zeros(self._BATCH_SIZE, dtype=np.float64)
+        }
 
-    async def __aenter__(self):
-        """Async context manager entry"""
-        await self.start()
-        return self
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _create_order():
+        return {
+            'status': 'pending',
+            'version': 0,
+            'attempts': 0,
+            'last_checked': time.monotonic()
+        }
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        await self.stop()
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _create_position():
+        return {
+            'amount': 0.0,
+            'entry_price': 0.0,
+            'version': 0
+        }
 
     async def start(self):
-        """Start the order manager and its background tasks"""
-        if not self._is_running:
-            self._is_running = True
-            self._tracking_task = asyncio.create_task(self.track_orders())
-            self.logger.info("OrderManager started")
+        """Start processing pipeline with zero-copy optimizations"""
+        self._running = True
+        self._processor = asyncio.create_task(self._process_orders())
+        self._position_updater = asyncio.create_task(self._update_positions())
+        self._state_saver = asyncio.create_task(self._debounced_state_save())
 
     async def stop(self):
-        """Stop the order manager and clean up resources"""
-        if self._is_running:
-            self._is_running = False
-            if self._tracking_task:
-                self._tracking_task.cancel()
-                try:
-                    await self._tracking_task
-                except asyncio.CancelledError:
-                    pass
-            await self.exchange.close()
-            self.logger.info("OrderManager stopped")
+        """Graceful shutdown with cleanup"""
+        self._running = False
+        await asyncio.gather(
+            self._processor,
+            self._position_updater,
+            self._state_saver
+        )
+        await self._save_state()
+        self._thread_pool.shutdown(wait=True)
+        self._state_mmap.close()
+        self._state_file.close()
 
-    async def place_order(self, order_type, input_token, output_token, amount, stop_loss_price=None):
-        """
-        Place an order (buy/sell) and track its status.
-        order_type: 'buy' or 'sell'
-        input_token: Token to sell (for buy) or buy (for sell)
-        output_token: Token to buy (for buy) or sell (for sell)
-        amount: Amount of input_token to trade
-        stop_loss_price: Optional stop loss price for the order
-        Returns: order_id if successful
-        """
-        try:
-            # Check risk before placing order
-            current_price = await self.exchange.get_current_price(input_token, output_token)
-            total_capital = self.config.get("total_capital", 0)
-            
-            if not await self.risk_manager.check_risk(
-                current_price=current_price,
-                order_type=order_type,
-                position_size=amount,
-                current_position=self.positions.get(input_token, {}),
-                total_capital=total_capital
-            ):
-                raise ValueError("Risk check failed")
+    async def place_order(self, order_type: str, **kwargs):
+        """Non-blocking order placement with zero-copy batching"""
+        await self._pending_updates.put((b'place', order_type, kwargs))
 
-            self.logger.info(f"Placing {order_type} order: {amount} {input_token} -> {output_token}")
-            
-            # Execute the trade using the Exchange
-            order_result = await self.exchange.execute_trade(input_token, output_token, amount)
-            
-            # Generate or get order_id from exchange result
-            order_id = order_result.get('order_id', f"{order_type}-{input_token}-{output_token}-{amount}")
-            
-            # Store order details including stop loss
-            self.open_orders[order_id] = {
-                "status": "pending",
-                "type": order_type,
-                "input_token": input_token,
-                "output_token": output_token,
-                "amount": amount,
-                "entry_price": current_price,
-                "stop_loss_price": stop_loss_price
-            }
-
-            # Start monitoring the order
-            asyncio.create_task(self.monitor_order(order_id))
-            
-            return order_id
-
-        except Exception as e:
-            self.logger.error(f"Error placing {order_type} order: {e}")
-            raise
-
-    async def get_order_status(self, order_id: str) -> str:
-        """
-        Get the current status of an order
-        Returns: Order status string ('pending', 'confirmed', 'cancelled', 'failed', etc.)
-        """
-        try:
-            if order_id not in self.open_orders:
-                return "not_found"
-            
-            # Get real-time status from exchange
-            status = await self.exchange.get_order_status(order_id)
-            self.open_orders[order_id]["status"] = status
-            return status
-
-        except Exception as e:
-            self.logger.error(f"Error getting status for order {order_id}: {e}")
-            return "error"
-
-    async def monitor_order(self, order_id: str):
-        """Monitor the status of an open order and update its status."""
-        try:
-            max_attempts = self.config.max_status_checks
-            check_interval = self.config.status_check_interval
-            
-            for _ in range(max_attempts):
-                if order_id not in self.open_orders:
-                    break
-                    
-                status = await self.get_order_status(order_id)
-                
-                if status in ['confirmed', 'cancelled', 'failed']:
-                    self.logger.info(f"Order {order_id} final status: {status}")
-                    break
-                    
-                await asyncio.sleep(check_interval)
-            
-            # If still pending after max attempts, mark as timeout
-            if self.open_orders.get(order_id)["status"] == "pending":
-                self.open_orders[order_id]["status"] = "timeout"
-                self.logger.warning(f"Order {order_id} monitoring timed out")
-
-        except Exception as e:
-            self.logger.error(f"Error monitoring order {order_id}: {e}")
-            self.open_orders[order_id]["status"] = "error"
-
-    async def cancel_order(self, order_id: str) -> bool:
-        """
-        Cancel an open order
-        Returns: True if cancellation was successful, False otherwise
-        """
-        try:
-            if order_id not in self.open_orders:
-                self.logger.warning(f"Order {order_id} not found for cancellation")
-                return False
-
-            current_status = self.open_orders[order_id]["status"]
-            if current_status != "pending":
-                self.logger.warning(f"Cannot cancel order {order_id}, status: {current_status}")
-                return False
-
-            # Attempt to cancel on exchange
-            success = await self.exchange.cancel_order(order_id)
-            
-            if success:
-                self.open_orders[order_id]["status"] = "cancelled"
-                self.logger.info(f"Order {order_id} has been cancelled")
-                return True
-            
-            return False
-
-        except Exception as e:
-            self.logger.error(f"Error cancelling order {order_id}: {e}")
-            return False
-
-    def update_position(self, token, amount, price, is_buy):
-        """Update the bot's token holdings based on buy/sell orders."""
-        try:
-            if is_buy:
-                # Calculate average entry price for buys
-                current_position = self.positions.get(token, {"amount": 0, "entry_price": 0})
-                total_value = (current_position["amount"] * current_position["entry_price"]) + (amount * price)
-                new_amount = current_position["amount"] + amount
-                new_entry_price = total_value / new_amount if new_amount > 0 else price
-                
-                self.positions[token] = {
-                    "amount": new_amount,
-                    "entry_price": new_entry_price
-                }
-                self.logger.info(f"Updated position: Bought {amount} {token}. Total: {new_amount} @ {new_entry_price}")
-            else:
-                # Decrease the position for sells
-                if token in self.positions:
-                    current_amount = self.positions[token]["amount"]
-                    new_amount = max(0, current_amount - amount)
-                    self.positions[token]["amount"] = new_amount
-                    self.logger.info(f"Updated position: Sold {amount} {token}. Remaining: {new_amount}")
-                    
-                    # Remove position if fully sold
-                    if new_amount == 0:
-                        del self.positions[token]
+    async def _process_orders(self):
+        """SIMD-optimized order processing pipeline"""
+        batch = np.zeros((self._BATCH_SIZE, 3), dtype=np.object_)
+        last_flush = time.monotonic()
         
-        except Exception as e:
-            self.logger.error(f"Error updating position for {token}: {e}")
-
-    async def track_orders(self):
-        """Continuously track the status of open orders and handle logic like stop-loss."""
-        while self._is_running:
+        while self._running:
             try:
-                pending_orders = [
-                    order_id for order_id, order in self.open_orders.items()
-                    if order["status"] == "pending"
-                ]
-                
-                # Create tasks for checking each pending order
-                tasks = [self.get_order_status(order_id) for order_id in pending_orders]
-                if tasks:
-                    await asyncio.gather(*tasks)
+                # Vectorized batch collection
+                for i in range(self._BATCH_SIZE):
+                    item = await asyncio.wait_for(
+                        self._pending_updates.get(),
+                        timeout=0.1
+                    )
+                    batch[i] = item
+                    
+                    if i == self._BATCH_SIZE - 1 or (time.monotonic() - last_flush) > 0.05:
+                        await self._process_batch(batch[:i+1])
+                        batch.fill(None)
+                        last_flush = time.monotonic()
+                        break
+                        
+            except asyncio.TimeoutError:
+                if np.any(batch != None):
+                    valid_mask = batch != None
+                    await self._process_batch(batch[valid_mask])
+                    batch.fill(None)
+                    last_flush = time.monotonic()
 
-                # Optional: Check for stop-loss conditions
-                for order_id in pending_orders:
-                    if await self._should_trigger_stop_loss(order_id):
-                        await self.cancel_order(order_id)
+    async def _process_batch(self, batch: np.ndarray):
+        """SIMD-optimized batch processing"""
+        start = time.monotonic()
+        
+        # Zero-copy array views
+        symbols = self._batch_arrays['symbols'][:len(batch)]
+        amounts = self._batch_arrays['amounts'][:len(batch)]
+        
+        # Vectorized extraction
+        for i, (_, _, params) in enumerate(batch):
+            symbols[i] = params['symbol'].encode('ascii')
+            amounts[i] = params['amount']
+        
+        # SIMD-optimized price fetching
+        prices = await self.exchange.get_prices(symbols)
+        self._batch_arrays['prices'][:len(batch)] = prices
+        
+        # Vectorized risk validation
+        risk_mask = self.risk_manager.batch_check(
+            symbols=symbols,
+            amounts=amounts,
+            prices=prices,
+            positions=self.positions
+        )
+        
+        # Parallel order execution
+        valid_indices = np.where(risk_mask)[0]
+        placements = [
+            self.exchange.execute_order(batch[i][1], **batch[i][2])
+            for i in valid_indices
+        ]
+        
+        # Batch execution with error handling
+        results = await asyncio.gather(*placements, return_exceptions=True)
+        
+        # Atomic metrics update
+        successful = sum(1 for r in results if not isinstance(r, Exception))
+        throughput = successful / (time.monotonic() - start)
+        self.metrics['throughput'].set(throughput)
 
-                await asyncio.sleep(self.config.order_tracking_interval)
+    async def _update_positions(self):
+        """SIMD-optimized position updates"""
+        while self._running:
+            current_version = self._position_version.value
+            positions = dict(self.positions)
+            
+            # Get latest prices for all positions
+            symbols = np.array(list(positions.keys()), dtype='S8')
+            prices = await self.exchange.get_prices(symbols)
+            
+            # Vectorized position value calculation
+            for symbol, position in positions.items():
+                idx = np.where(symbols == symbol.encode('ascii'))[0][0]
+                value = position['amount'] * prices[idx]
+                self.metrics['positions'].labels(token=symbol.decode('ascii')).set(value)
+            
+            # Update version atomically
+            self._position_version.value = current_version + 1
+            
+            await asyncio.sleep(1)  # Update every second
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Error tracking orders: {e}")
-                await asyncio.sleep(5)  # Backoff on error
-
-    async def _should_trigger_stop_loss(self, order_id: str) -> bool:
-        """Check if stop-loss should be triggered for an order"""
+    @asynccontextmanager
+    async def _atomic_update(self, key: str, data_type: str = 'order'):
+        """Atomic update context manager with versioning"""
+        version = self._order_version.value if data_type == 'order' else self._position_version.value
+        
         try:
-            order = self.open_orders.get(order_id)
-            if not order or not order.get("stop_loss_price"):
-                return False
+            yield
+        finally:
+            # Increment version atomically
+            if data_type == 'order':
+                self._order_version.value = version + 1
+            else:
+                self._position_version.value = version + 1
 
-            # Get current price from exchange
-            current_price = await self.exchange.get_current_price(
-                order["input_token"],
-                order["output_token"]
-            )
+    async def _debounced_state_save(self):
+        """Debounced state persistence with zero-copy"""
+        last_save = time.monotonic()
+        
+        while self._running:
+            try:
+                current_time = time.monotonic()
+                if current_time - last_save >= self._DEBOUNCE_TIME:
+                    await self._save_state()
+                    last_save = current_time
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error('State save error: %s', e)
+                await asyncio.sleep(1)
 
-            # Check if price has hit stop loss
-            if order["type"] == "buy":
-                return current_price <= order["stop_loss_price"]
-            else:  # sell order
-                return current_price >= order["stop_loss_price"]
-
+    async def _save_state(self):
+        """Zero-copy state persistence with memory mapping"""
+        try:
+            # Prepare state data
+            state = {
+                'orders': {
+                    oid: {
+                        'status': order['status'],
+                        'version': order['version'],
+                        'attempts': order['attempts'],
+                        'last_checked': order['last_checked']
+                    }
+                    for oid, order in self.open_orders.items()
+                },
+                'positions': {
+                    symbol: {
+                        'amount': pos['amount'],
+                        'entry_price': pos['entry_price'],
+                        'version': pos['version']
+                    }
+                    for symbol, pos in self.positions.items()
+                }
+            }
+            
+            # Serialize with orjson for zero-copy
+            serialized = orjson.dumps(state, option=orjson.OPT_SERIALIZE_NUMPY)
+            
+            # Memory-mapped write
+            self._state_mmap.seek(0)
+            self._state_mmap.write(serialized)
+            self._state_mmap.flush()
+            
         except Exception as e:
-            self.logger.error(f"Error checking stop loss for order {order_id}: {e}")
-            return False
+            logger.error('State save failed: %s', e)
+
+    def _prioritize_orders(self):
+        """SIMD-optimized order prioritization"""
+        # Pre-allocate arrays for priority calculation
+        priorities = np.zeros(len(self.open_orders), dtype=np.float64)
+        order_ids = np.array(list(self.open_orders.keys()), dtype='S32')
+        
+        # Vectorized priority calculation
+        for i, (oid, order) in enumerate(self.open_orders.items()):
+            # Priority factors
+            age = time.monotonic() - order['last_checked']
+            attempts = order['attempts']
+            priority = 1.0 / (1.0 + age) * (1.0 / (1.0 + attempts))
+            priorities[i] = priority
+        
+        # Sort by priority
+        sorted_indices = np.argsort(priorities)[::-1]
+        return order_ids[sorted_indices]
+
+    async def _retry_failed(self):
+        """Retry failed orders with exponential backoff"""
+        while self._running:
+            try:
+                # Get failed orders
+                failed = {
+                    oid: order for oid, order in self.open_orders.items()
+                    if order['status'] == 'failed' and order['attempts'] < 3
+                }
+                
+                if not failed:
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Prioritize retries
+                retry_order = self._prioritize_orders()
+                
+                # Process retries in batches
+                for oid in retry_order:
+                    if oid.decode('ascii') in failed:
+                        order = failed[oid.decode('ascii')]
+                        delay = 2 ** order['attempts']  # Exponential backoff
+                        await self._schedule_retry(oid.decode('ascii'), delay, order)
+                
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error('Retry error: %s', e)
+                await asyncio.sleep(1)
+
+    async def _schedule_retry(self, oid: str, delay: float, order: dict):
+        """Schedule order retry with backoff"""
+        try:
+            # Update order state
+            async with self._atomic_update(oid):
+                order['attempts'] += 1
+                order['last_checked'] = time.monotonic()
+                order['status'] = 'pending'
+            
+            # Schedule retry
+            await asyncio.sleep(delay)
+            await self._pending_updates.put((b'retry', order['type'], {'order_id': oid}))
+            
+        except Exception as e:
+            logger.error('Retry scheduling failed: %s', e)

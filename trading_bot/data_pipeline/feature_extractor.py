@@ -1,169 +1,205 @@
 import asyncio
-import numpy as np
-from trading_bot.data_pipeline.data_storage import DataStorage
 import logging
+import numpy as np
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-import re
+from cachetools import TTLCache
+from prometheus_client import Counter, Histogram, Gauge
+from trading_bot.utils.helpers import Helpers
+
+logger = logging.getLogger(__name__)
 
 class FeatureExtractor:
-    def __init__(self, config):
+    _VECTOR_SIZE = 1000  # Pre-allocated vector size
+    _TREND_WINDOW = 10
+    _BATCH_SIZE = 1000
+    _CACHE_TTL = 300  # 5 minutes cache TTL
+    
+    def __init__(self, config, data_storage):
         self.config = config
-        self.data_storage = DataStorage(self.config)
-        self.logger = logging.getLogger()
-
-    async def analyze_token_name(self, token_name: str) -> Dict[str, float]:
-        """Analyze token name for potential features."""
-        features = {
-            'name_length': len(token_name),
-            'has_numbers': float(bool(re.search(r'\d', token_name))),
-            'is_all_caps': float(token_name.isupper()),
-            'special_chars_count': float(len(re.findall(r'[^a-zA-Z0-9]', token_name)))
+        self.data_storage = data_storage
+        
+        # Optimized cache with larger size and longer TTL
+        self.cache = TTLCache(maxsize=50_000, ttl=self._CACHE_TTL)
+        
+        # Pre-allocated numpy arrays with optimal memory alignment
+        self._price_buffer = np.zeros(self._VECTOR_SIZE, dtype=np.float32, order='C')
+        self._volume_buffer = np.zeros(self._VECTOR_SIZE, dtype=np.float32, order='C')
+        self._liquidity_buffer = np.zeros(self._VECTOR_SIZE, dtype=np.float32, order='C')
+        self._buffer_index = 0
+        
+        # Pre-allocate arrays for calculations
+        self._price_changes = np.zeros(self._VECTOR_SIZE, dtype=np.float32, order='C')
+        self._volume_changes = np.zeros(self._VECTOR_SIZE, dtype=np.float32, order='C')
+        self._liquidity_changes = np.zeros(self._VECTOR_SIZE, dtype=np.float32, order='C')
+        
+        # Validation ranges with optimized bounds
+        self._validation = {
+            'price': (0.0, 1e6),  # Reasonable upper bound
+            'volume': (0.0, 1e9),
+            'liquidity': (0.0, 1e9),
+            'sentiment': (-1.0, 1.0),
+            'price_change': (-100.0, 100.0),
+            'price_trend': (-1e3, 1e3),
+            'price_volatility': (0.0, 1e3)
         }
-        return features
-
-    async def calculate_liquidity_features(self, raw_data: List[Dict]) -> Optional[Dict[str, float]]:
-        """Calculate liquidity-related features."""
-        try:
-            liquidity_data = [item['liquidity'] for item in raw_data if 'liquidity' in item]
-            if not liquidity_data:
-                return None
-            
-            liquidity_array = np.array(liquidity_data)
-            return {
-                'initial_liquidity': float(liquidity_array[0]),
-                'current_liquidity': float(liquidity_array[-1]),
-                'liquidity_change': float((liquidity_array[-1] - liquidity_array[0]) / liquidity_array[0] * 100),
-                'liquidity_volatility': float(np.std(liquidity_array))
-            }
-        except Exception as e:
-            self.logger.error(f"Error calculating liquidity features: {e}")
-            return None
-
-    async def calculate_price_features(self, raw_data: List[Dict]) -> Optional[Dict[str, float]]:
-        """Calculate price-related features."""
-        try:
-            prices = np.array([item['price'] for item in raw_data if 'price' in item])
-            if len(prices) < 2:
-                return None
-
-            returns = np.diff(prices) / prices[:-1]
-            return {
-                'price_change_pct': float((prices[-1] - prices[0]) / prices[0] * 100),
-                'price_volatility': float(np.std(returns) * 100),
-                'max_drawdown': float(self._calculate_max_drawdown(prices)),
-                'price_momentum': float(self._calculate_momentum(prices))
-            }
-        except Exception as e:
-            self.logger.error(f"Error calculating price features: {e}")
-            return None
-
-    def _calculate_max_drawdown(self, prices: np.ndarray) -> float:
-        """Calculate the maximum drawdown from peak."""
-        peak = prices[0]
-        max_drawdown = 0
         
-        for price in prices[1:]:
-            if price > peak:
-                peak = price
-            drawdown = (peak - price) / peak * 100
-            max_drawdown = max(max_drawdown, drawdown)
+        # Metrics with optimized labels
+        self.metrics = {
+            'processed': Counter('features_processed', 'Total processed items'),
+            'errors': Counter('feature_errors', 'Processing errors'),
+            'latency': Histogram('feature_latency', 'Processing latency in seconds', buckets=(0.1, 0.5, 1.0, 2.0, 5.0)),
+            'cache': Gauge('feature_cache', 'Current cache size'),
+            'throughput': Gauge('feature_throughput', 'Items/sec', ['window'])
+        }
         
-        return max_drawdown
+        # Throughput tracking with optimized window size
+        self._throughput_window = np.zeros(100, dtype=np.int32)  # Pre-allocated array
+        self._window_index = 0
+        self._last_throughput = datetime.now()
 
-    def _calculate_momentum(self, prices: np.ndarray, period: int = 14) -> float:
-        """Calculate price momentum using ROC (Rate of Change)."""
-        if len(prices) < period:
-            return 0
-        return (prices[-1] - prices[-period]) / prices[-period] * 100
+    def _vectorized_validation(self, values: np.ndarray, feature: str) -> np.ndarray:
+        """Vectorized validation using numpy with SIMD optimization"""
+        min_val, max_val = self._validation[feature]
+        return np.logical_and(values >= min_val, values <= max_val)
 
-    async def calculate_volume_features(self, raw_data: List[Dict]) -> Optional[Dict[str, float]]:
-        """Calculate volume-related features."""
-        try:
-            volumes = np.array([item['volume'] for item in raw_data if 'volume' in item])
-            if len(volumes) < 5:
-                return None
+    async def _batch_process(self, data_batch: List[Dict]) -> List[Dict]:
+        """Process batch of data using optimized vectorized operations"""
+        if not data_batch:
+            return []
 
-            return {
-                'volume_mean': float(np.mean(volumes)),
-                'volume_std': float(np.std(volumes)),
-                'volume_trend': float(self._calculate_trend(volumes)),
-                'volume_acceleration': float(np.mean(np.diff(volumes)))
+        # Pre-allocate structured array with optimal memory layout
+        dtype = np.dtype([
+            ('price', 'f4'), ('volume', 'f4'), ('liquidity', 'f4'),
+            ('prev_price', 'f4'), ('prev_volume', 'f4'), ('prev_liquidity', 'f4')
+        ])
+        
+        # Create array with list comprehension for better performance
+        arr = np.array([
+            (d.get('price', 0), d.get('volume', 0), d.get('liquidity', 0),
+             d.get('previous_price', 0), d.get('previous_volume', 0),
+             d.get('previous_liquidity', 0))
+            for d in data_batch
+        ], dtype=dtype)
+
+        # Vectorized calculations with SIMD optimization
+        valid = np.ones(len(arr), dtype=bool)
+        
+        # Price features with optimized division
+        price_mask = self._vectorized_validation(arr['price'], 'price')
+        valid &= price_mask
+        np.divide(
+            arr['price'] - arr['prev_price'],
+            arr['prev_price'],
+            out=self._price_changes[:len(arr)],
+            where=arr['prev_price'] != 0
+        )
+        self._price_changes[:len(arr)] *= 100
+
+        # Volume features
+        volume_mask = self._vectorized_validation(arr['volume'], 'volume')
+        valid &= volume_mask
+        np.divide(
+            arr['volume'] - arr['prev_volume'],
+            arr['prev_volume'],
+            out=self._volume_changes[:len(arr)],
+            where=arr['prev_volume'] != 0
+        )
+        self._volume_changes[:len(arr)] *= 100
+
+        # Liquidity features
+        liquidity_mask = self._vectorized_validation(arr['liquidity'], 'liquidity')
+        valid &= liquidity_mask
+        np.divide(
+            arr['liquidity'] - arr['prev_liquidity'],
+            arr['prev_liquidity'],
+            out=self._liquidity_changes[:len(arr)],
+            where=arr['prev_liquidity'] != 0
+        )
+        self._liquidity_changes[:len(arr)] *= 100
+
+        # Build results using list comprehension for better performance
+        return [
+            {
+                'price': arr['price'][i],
+                'price_change': self._price_changes[i],
+                'volume': arr['volume'][i],
+                'volume_change': self._volume_changes[i],
+                'liquidity': arr['liquidity'][i],
+                'liquidity_change': self._liquidity_changes[i]
             }
-        except Exception as e:
-            self.logger.error(f"Error calculating volume features: {e}")
-            return None
+            for i in range(len(arr))
+            if valid[i]
+        ]
 
-    def _calculate_trend(self, data: np.ndarray) -> float:
-        """Calculate linear trend coefficient."""
-        try:
-            x = np.arange(len(data))
-            z = np.polyfit(x, data, 1)
-            return z[0]
-        except:
-            return 0.0
-
-    async def calculate_features(self, raw_data: List[Dict]) -> Optional[Dict[str, float]]:
-        """Calculate comprehensive features from raw data."""
-        try:
-            if not raw_data:
-                return None
-
-            # Gather all features asynchronously
-            features = {}
+    async def _calculate_trends(self, buffer: np.ndarray) -> np.ndarray:
+        """Calculate rolling trends using optimized matrix operations"""
+        if len(buffer) < self._TREND_WINDOW:
+            return np.zeros(len(buffer), dtype=np.float32)
             
-            # Token name features
-            if 'token_name' in raw_data[0]:
-                token_features = await self.analyze_token_name(raw_data[0]['token_name'])
-                features.update(token_features)
+        # Create optimized sliding window view
+        shape = (len(buffer) - self._TREND_WINDOW + 1, self._TREND_WINDOW)
+        strides = (buffer.strides[0], buffer.strides[0])
+        windows = np.lib.stride_tricks.as_strided(
+            buffer, shape=shape, strides=strides
+        )
+        
+        # Pre-compute means for better performance
+        x = np.arange(self._TREND_WINDOW, dtype=np.float32)
+        x_mean = x.mean()
+        y_mean = windows.mean(axis=1)
+        
+        # Vectorized trend calculation with optimized memory access
+        numerator = np.sum((windows - y_mean[:, None]) * (x - x_mean), axis=1)
+        denominator = np.sum((x - x_mean) ** 2)
+        
+        return numerator / denominator
 
-            # Calculate different feature categories concurrently
-            feature_tasks = [
-                self.calculate_liquidity_features(raw_data),
-                self.calculate_price_features(raw_data),
-                self.calculate_volume_features(raw_data)
-            ]
-            
-            feature_results = await asyncio.gather(*feature_tasks)
-            
-            # Combine all features
-            for result in feature_results:
-                if result:
-                    features.update(result)
-
-            return features if features else None
-
-        except Exception as e:
-            self.logger.error(f"Error calculating features: {e}")
-            return None
-
-    async def extract_features(self):
-        """Continuously retrieve raw data and extract features."""
+    async def process_stream(self):
+        """Main processing loop with optimized throughput and resource usage"""
         while True:
+            start_time = datetime.now()
+            
             try:
-                # Fetch raw data from DataStorage
-                raw_data = await self.data_storage.get_raw_data()
-
-                if raw_data:
-                    # Calculate features from the raw data
-                    features = await self.calculate_features(raw_data)
-
-                    if features is not None:
-                        # Store extracted features back into DataStorage
-                        await self.data_storage.store_features(features)
-                    else:
-                        self.logger.warning("Feature calculation returned None")
-
-                    # Control the loop frequency
-                    await asyncio.sleep(self.config.feature_extraction_interval)
-                else:
-                    self.logger.warning("No raw data available, skipping feature extraction.")
-                    await asyncio.sleep(5)  # Wait before retrying
-
+                # Batch data collection with timeout
+                raw_data = await asyncio.wait_for(
+                    self.data_storage.get_latest_batch(self._BATCH_SIZE),
+                    timeout=0.1
+                )
+                
+                if not raw_data:
+                    await asyncio.sleep(0.01)  # Reduced sleep time
+                    continue
+                
+                # Process batch with optimized memory usage
+                batch_start = datetime.now()
+                features = await self._batch_process(raw_data)
+                
+                # Update metrics efficiently
+                if features:
+                    self.metrics['processed'].inc(len(features))
+                    self.metrics['latency'].observe(
+                        (datetime.now() - batch_start).total_seconds()
+                    )
+                    await self.data_storage.batch_store_features(features)
+                
+                # Optimized throughput calculation
+                self._throughput_window[self._window_index] = len(features)
+                self._window_index = (self._window_index + 1) % 100
+                
+                if (datetime.now() - self._last_throughput).seconds >= 5:
+                    tps = np.sum(self._throughput_window) / 5
+                    self.metrics['throughput'].labels(window='5s').set(tps)
+                    self._last_throughput = datetime.now()
+                
+                # Adaptive sleep with optimized timing
+                processing_time = (datetime.now() - start_time).total_seconds()
+                sleep_time = max(0.001, min(0.1, (len(features) / self._BATCH_SIZE) * 0.01))
+                await asyncio.sleep(sleep_time)
+                
+            except asyncio.TimeoutError:
+                continue
             except Exception as e:
-                self.logger.error(f"Error in feature extraction loop: {e}")
-                await asyncio.sleep(5)  # Backoff on error
-
-    async def start_extraction(self):
-        """Start the feature extraction loop."""
-        self.logger.info("Starting feature extraction process...")
-        await self.extract_features()
+                self.metrics['errors'].inc()
+                logger.error("Processing error: %s", e, exc_info=True)
+                await asyncio.sleep(0.1)  # Reduced error sleep time
