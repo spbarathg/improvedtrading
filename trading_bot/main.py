@@ -78,13 +78,13 @@ class TradingBot:
         while not self.shutdown_flag:
             try:
                 # Get the latest features from DataStorage
-                features = self.data_storage.get_latest_features()
+                features = await self.data_storage.get_latest_features()
 
                 # Get predictions from the selected model
                 predictions = await self.model_selector.predict(features)
 
                 # Perform risk management checks
-                if self.risk_manager.pre_trade_checks(predictions, features):
+                if await self.risk_manager.pre_trade_checks(predictions, features):
                     # Place orders if risk checks pass
                     await self.order_manager.place_orders(predictions, features)
 

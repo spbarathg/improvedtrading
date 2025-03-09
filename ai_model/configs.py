@@ -44,3 +44,33 @@ class ModelConfig:
 
     # Miscellaneous
     MAX_RETRIES = 3  # Maximum number of retries for any failed operation
+
+    # Model Performance Thresholds
+    MIN_ACCURACY_THRESHOLD = 0.6  # Minimum accuracy required for model deployment
+    MIN_F1_THRESHOLD = 0.65  # Minimum F1 score required for model deployment
+    DRIFT_DETECTION_THRESHOLD = 0.1  # Maximum allowed drift before model retraining
+
+    # Cross-validation Settings
+    N_SPLITS = 5  # Number of folds for cross-validation
+    CV_SCORING = ['accuracy', 'f1', 'precision', 'recall']  # Metrics for cross-validation
+
+    # Feature Engineering
+    FEATURE_SELECTION_METHOD = "recursive"  # Method for feature selection
+    MAX_FEATURES = 20  # Maximum number of features to select
+    FEATURE_IMPORTANCE_THRESHOLD = 0.01  # Minimum importance threshold for feature selection
+
+    # Model Versioning
+    MODEL_VERSION_FORMAT = "v{major}.{minor}.{patch}"  # Format for model versioning
+    AUTO_VERSION_INCREMENT = True  # Whether to automatically increment version on training
+    MODEL_REGISTRY_PATH = "models/registry"  # Path to store model versions
+
+    # Monitoring Configurations
+    ENABLE_MONITORING = True  # Whether to enable model monitoring
+    MONITORING_METRICS = [  # List of metrics to monitor
+        "accuracy",
+        "latency",
+        "prediction_drift",
+        "feature_drift"
+    ]
+    MONITORING_INTERVAL = 300  # Interval (in seconds) for monitoring metrics collection
+    ALERT_THRESHOLD = 0.2  # Threshold for monitoring alerts

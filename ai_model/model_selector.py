@@ -1,89 +1,164 @@
 import logging
 import numpy as np
+from collections import deque
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+import asyncio
+from typing import Dict, Tuple, List, Any
 
 logger = logging.getLogger(__name__)
 
 class ModelSelector:
     """
-    Selects between the online and periodic models based on their performance.
-    Implements dynamic model switching or weighted averaging.
+    Handles the dynamic selection between online and periodic models based on their performance.
+    Uses a validation set to evaluate and compare model performance using multiple metrics.
     """
 
-    def __init__(self, online_model, periodic_model, config):
+    def __init__(self, 
+                 performance_window: int = 1000,
+                 selection_threshold: float = 0.05,
+                 metrics_weights: Dict[str, float] = None):
         """
-        Initializes the ModelSelector.
-        :param online_model: Instance of the online learning model.
-        :param periodic_model: Instance of the periodically retrained model.
-        :param config: Configuration settings (e.g., evaluation intervals, performance threshold).
+        Initialize the ModelSelector with configuration parameters.
+        
+        Args:
+            performance_window: Number of recent predictions to consider for performance evaluation
+            selection_threshold: Minimum performance difference to switch models
+            metrics_weights: Dictionary of metric names and their weights in the final score
         """
-        self.online_model = online_model
-        self.periodic_model = periodic_model
-        self.config = config
-        self.current_model = None
-
-        # Performance tracking (accuracy, or another relevant metric)
-        self.online_performance = None
-        self.periodic_performance = None
-
-    def evaluate_model(self, model, validation_data):
+        self.performance_window = performance_window
+        self.selection_threshold = selection_threshold
+        
+        # Default weights for different metrics if none provided
+        self.metrics_weights = metrics_weights or {
+            'accuracy': 0.3,
+            'precision': 0.3,
+            'recall': 0.2,
+            'f1': 0.2
+        }
+        
+        # Performance history for both models
+        self.online_performance_history = []
+        self.periodic_performance_history = []
+        
+        # Currently selected model type
+        self.current_model = 'periodic'  # Start with periodic as default
+        
+    async def evaluate_models(self, 
+                            validation_features: np.ndarray,
+                            validation_labels: np.ndarray,
+                            online_predictions: np.ndarray,
+                            periodic_predictions: np.ndarray) -> str:
         """
-        Evaluates a model's performance on the validation set.
-        :param model: The model to evaluate.
-        :param validation_data: A tuple (X_val, y_val) of validation features and labels.
-        :return: The performance metric (accuracy or another relevant metric).
+        Evaluate both models on validation data and select the better performing one.
+        
+        Args:
+            validation_features: Features from validation set
+            validation_labels: True labels from validation set
+            online_predictions: Predictions from online model
+            periodic_predictions: Predictions from periodic model
+            
+        Returns:
+            str: Selected model type ('online' or 'periodic')
         """
-        X_val, y_val = validation_data
-
-        # Ensure the model is trained before evaluation
-        if not model.is_trained:
-            logger.warning(f"{model.__class__.__name__} is not trained. Skipping evaluation.")
-            return 0
-
-        # Get predictions and calculate accuracy or other performance metrics
-        predictions = model.model.predict(X_val)
-        accuracy = np.mean(predictions == y_val)
-        return accuracy
-
-    def get_current_model(self):
-        """
-        Returns the currently selected model (either online or periodic) based on performance.
-        If dynamic model switching is enabled, it compares performance and selects the best one.
-        """
-        if self.config.DYNAMIC_MODEL_SWITCHING:
-            if self.online_performance is None or self.periodic_performance is None:
-                logger.info("Model performance has not been evaluated yet. Selecting online model by default.")
-                self.current_model = self.online_model
-            else:
-                # Compare performance and select the model with the better score
-                if self.online_performance >= self.periodic_performance:
-                    logger.info("Online model selected based on better performance.")
-                    self.current_model = self.online_model
-                else:
-                    logger.info("Periodic model selected based on better performance.")
-                    self.current_model = self.periodic_model
-        else:
-            logger.info("Dynamic model switching disabled. Using online model by default.")
-            self.current_model = self.online_model
-
+        # Calculate performance metrics for both models
+        online_metrics = await self._calculate_metrics(validation_labels, online_predictions)
+        periodic_metrics = await self._calculate_metrics(validation_labels, periodic_predictions)
+        
+        # Calculate weighted scores
+        online_score = self._calculate_weighted_score(online_metrics)
+        periodic_score = self._calculate_weighted_score(periodic_metrics)
+        
+        # Update performance history
+        self.online_performance_history.append(online_score)
+        self.periodic_performance_history.append(periodic_score)
+        
+        # Maintain window size
+        if len(self.online_performance_history) > self.performance_window:
+            self.online_performance_history.pop(0)
+            self.periodic_performance_history.pop(0)
+        
+        # Calculate average performance over the window
+        avg_online = np.mean(self.online_performance_history)
+        avg_periodic = np.mean(self.periodic_performance_history)
+        
+        # Determine if we should switch models
+        if abs(avg_online - avg_periodic) > self.selection_threshold:
+            self.current_model = 'online' if avg_online > avg_periodic else 'periodic'
+            
         return self.current_model
-
-    def update_model_performance(self, validation_data):
+    
+    async def _calculate_metrics(self, 
+                               true_labels: np.ndarray, 
+                               predictions: np.ndarray) -> Dict[str, float]:
         """
-        Evaluates both models on the validation set at regular intervals and updates their performance.
-        :param validation_data: A tuple (X_val, y_val) of validation features and labels.
+        Calculate various performance metrics asynchronously.
+        
+        Args:
+            true_labels: Array of true labels
+            predictions: Array of model predictions
+            
+        Returns:
+            Dictionary containing different performance metrics
         """
-        self.online_performance = self.evaluate_model(self.online_model, validation_data)
-        self.periodic_performance = self.evaluate_model(self.periodic_model, validation_data)
-
-        logger.info(f"Online model performance: {self.online_performance}")
-        logger.info(f"Periodic model performance: {self.periodic_performance}")
-
-    async def predict(self, features):
+        metrics = {}
+        
+        # Use asyncio.to_thread for CPU-bound operations
+        metrics['accuracy'] = await asyncio.to_thread(
+            accuracy_score, true_labels, predictions
+        )
+        metrics['precision'] = await asyncio.to_thread(
+            precision_score, true_labels, predictions, average='weighted'
+        )
+        metrics['recall'] = await asyncio.to_thread(
+            recall_score, true_labels, predictions, average='weighted'
+        )
+        metrics['f1'] = await asyncio.to_thread(
+            f1_score, true_labels, predictions, average='weighted'
+        )
+        
+        return metrics
+    
+    def _calculate_weighted_score(self, metrics: Dict[str, float]) -> float:
         """
-        Uses the currently selected model to make predictions.
-        :param features: The input features for prediction.
-        :return: The prediction from the selected model.
+        Calculate a weighted score from multiple metrics.
+        
+        Args:
+            metrics: Dictionary of metric names and their values
+            
+        Returns:
+            float: Weighted performance score
         """
-        current_model = self.get_current_model()
-        prediction = await current_model.predict(features)
-        return prediction
+        return sum(
+            metrics[metric] * weight 
+            for metric, weight in self.metrics_weights.items()
+        )
+    
+    def get_current_model(self) -> str:
+        """
+        Get the currently selected model type.
+        
+        Returns:
+            str: Current model type ('online' or 'periodic')
+        """
+        return self.current_model
+    
+    async def get_performance_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of recent performance for both models.
+        
+        Returns:
+            Dictionary containing performance statistics for both models
+        """
+        return {
+            'online': {
+                'current_score': self.online_performance_history[-1] if self.online_performance_history else None,
+                'average_score': np.mean(self.online_performance_history) if self.online_performance_history else None,
+                'trend': np.gradient(self.online_performance_history).tolist() if len(self.online_performance_history) > 1 else None
+            },
+            'periodic': {
+                'current_score': self.periodic_performance_history[-1] if self.periodic_performance_history else None,
+                'average_score': np.mean(self.periodic_performance_history) if self.periodic_performance_history else None,
+                'trend': np.gradient(self.periodic_performance_history).tolist() if len(self.periodic_performance_history) > 1 else None
+            },
+            'current_model': self.current_model
+        }

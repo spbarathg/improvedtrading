@@ -1,6 +1,7 @@
 import os
 import pickle
 import logging
+import numpy as np
 from sklearn.linear_model import SGDClassifier, PassiveAggressiveClassifier
 from sklearn.preprocessing import StandardScaler
 from ai_model.base_model import BaseModel
@@ -10,35 +11,82 @@ logger = logging.getLogger(__name__)
 class OnlineModel(BaseModel):
     """
     Implements an online learning model using SGDClassifier or PassiveAggressiveClassifier.
-    Supports incremental learning with mini-batches and feature scaling.
+    Supports incremental learning with mini-batches, feature scaling, and learning rate scheduling.
     """
 
     def __init__(self, config):
         self.config = config
         self.model_type = self.config.MODEL_TYPE  # e.g., 'SGD' or 'PA' (Passive Aggressive)
-        self.learning_rate = self.config.LEARNING_RATE
+        self.batch_size = getattr(self.config, 'BATCH_SIZE', 32)
+        self.initial_learning_rate = getattr(self.config, 'LEARNING_RATE', 0.01)
+        self.learning_rate_schedule = getattr(self.config, 'LEARNING_RATE_SCHEDULE', 'optimal')
         self.scaler = StandardScaler()
+        
+        # Initialize learning rate parameters
+        self.n_iterations = 0
+        self.current_learning_rate = self.initial_learning_rate
 
         # Initialize the model based on the config
         if self.model_type == "SGD":
-            self.model = SGDClassifier(loss='log', learning_rate='optimal')
+            self.model = SGDClassifier(
+                loss='log',
+                learning_rate=self.learning_rate_schedule,
+                eta0=self.initial_learning_rate,
+                warm_start=True  # Enable warm start for continuous training
+            )
         elif self.model_type == "PA":
-            self.model = PassiveAggressiveClassifier()
+            self.model = PassiveAggressiveClassifier(
+                C=self.initial_learning_rate,
+                warm_start=True
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        self.is_trained = False  # Keeps track of whether the model has been trained
+        self.is_trained = False
+        self.classes_ = None  # Store unique classes for partial_fit
+
+    def _update_learning_rate(self):
+        """Updates the learning rate based on the chosen schedule."""
+        if self.learning_rate_schedule == 'inverse_scaling':
+            self.current_learning_rate = (
+                self.initial_learning_rate / (1 + self.initial_learning_rate * self.n_iterations)
+            )
+            if isinstance(self.model, SGDClassifier):
+                self.model.eta0 = self.current_learning_rate
+        self.n_iterations += 1
+
+    def _create_mini_batches(self, X, y, batch_size):
+        """Creates mini-batches from input data."""
+        indices = np.arange(len(X))
+        np.random.shuffle(indices)
+        
+        for start_idx in range(0, len(X), batch_size):
+            end_idx = min(start_idx + batch_size, len(X))
+            batch_indices = indices[start_idx:end_idx]
+            yield X[batch_indices], y[batch_indices]
 
     def train(self, data):
         """
-        Trains the model on the provided data (initial batch training).
+        Trains the model on the provided data using mini-batches.
         :param data: A tuple (X_train, y_train) where X_train are features and y_train are labels.
         """
         X_train, y_train = data
-        X_train_scaled = self.scaler.fit_transform(X_train)
+        self.classes_ = np.unique(y_train)
         
-        # Train the model on the scaled data
-        self.model.fit(X_train_scaled, y_train)
-        self.is_trained = True
-        logger.info("Model trained on initial data batch.")
+        # Initial fit of the scaler
+        self.scaler.fit(X_train)
+        
+        # Train in mini-batches
+        for X_batch, y_batch in self._create_mini_batches(X_train, y_train, self.batch_size):
+            X_batch_scaled = self.scaler.transform(X_batch)
+            if not self.is_trained:
+                self.model.fit(X_batch_scaled, y_batch)
+                self.is_trained = True
+            else:
+                self.model.partial_fit(X_batch_scaled, y_batch, classes=self.classes_)
+            self._update_learning_rate()
+        
+        logger.info(f"Model trained on initial data with {len(X_train)} samples")
 
     async def predict(self, features):
         """
@@ -56,7 +104,7 @@ class OnlineModel(BaseModel):
 
     def partial_fit(self, data):
         """
-        Updates the model incrementally using mini-batches of new data (online learning).
+        Updates the model incrementally using mini-batches of new data.
         :param data: A tuple (X_train, y_train) where X_train are features and y_train are labels.
         """
         X_train, y_train = data
@@ -66,10 +114,16 @@ class OnlineModel(BaseModel):
             self.train(data)
             return
 
-        # Perform feature scaling with incremental fitting
-        X_train_scaled = self.scaler.partial_fit(X_train).transform(X_train)
-        self.model.partial_fit(X_train_scaled, y_train)
-        logger.info("Model parameters updated using partial_fit.")
+        # Process data in mini-batches
+        for X_batch, y_batch in self._create_mini_batches(X_train, y_train, self.batch_size):
+            # Update scaler and transform batch
+            X_batch_scaled = self.scaler.partial_fit(X_batch).transform(X_batch)
+            
+            # Update model
+            self.model.partial_fit(X_batch_scaled, y_batch, classes=self.classes_)
+            self._update_learning_rate()
+        
+        logger.info(f"Model updated with {len(X_train)} new samples")
 
     def save(self, filepath):
         """
