@@ -1,76 +1,155 @@
-class ModelConfig:
-    """
-    Configuration class containing constants and hyperparameters for AI model training, evaluation, 
-    and prediction processes.
-    """
+from pydantic import BaseModel, Field, ConfigDict, validator
+from typing import Literal, Dict, Optional, List
+from pathlib import Path
 
-    # General Model Settings
-    RANDOM_SEED = 42  # Seed for reproducibility
-    VALIDATION_SPLIT = 0.2  # Proportion of data to be used as validation set
-    BATCH_SIZE = 64  # Batch size for online training
-    EPOCHS = 100  # Number of epochs for training periodic models
-    EARLY_STOPPING_PATIENCE = 10  # Early stopping patience for periodic model training
+class MarketDataSchema(BaseModel):
+    """Schema for market data validation."""
+    price: float = Field(..., gt=0)
+    volume: float = Field(..., ge=0)
+    timestamp: int = Field(...)
+    bid: float = Field(..., gt=0)
+    ask: float = Field(..., gt=0)
+    symbol: str = Field(...)
+    depth_asks: List[List[float]] = Field(default_factory=list)
+    depth_bids: List[List[float]] = Field(default_factory=list)
+    
+    @validator('ask')
+    def ask_greater_than_bid(cls, v, values):
+        if 'bid' in values and v <= values['bid']:
+            raise ValueError('Ask price must be greater than bid price')
+        return v
 
-    # Online Model Configurations
-    ONLINE_MODEL_CLASS = "SGDClassifier"  # Class name for the online model
-    ONLINE_LEARNING_RATE = 0.01  # Learning rate for online model
-    ONLINE_SCALER_TYPE = "StandardScaler"  # Scaler type for online feature scaling
-    ONLINE_MODEL_SAVE_PATH = "models/online_model.pkl"  # Path to save the online model
+class ModelFeatureConfig(BaseModel):
+    """Configuration for model features."""
+    feature_names: List[str] = Field(
+        default=[
+            'price_change',
+            'volume_change',
+            'bid_ask_spread',
+            'order_imbalance',
+            'volatility',
+            'volume_price_correlation',
+            'rsi',
+            'macd',
+            'total_bid_volume',
+            'total_ask_volume'
+        ]
+    )
+    required_fields: List[str] = Field(
+        default=['price', 'volume', 'timestamp', 'bid', 'ask']
+    )
+    technical_indicators: List[str] = Field(
+        default=['rsi', 'macd', 'bollinger_bands']
+    )
+    feature_scaling: Dict[str, Dict] = Field(
+        default={
+            'price_change': {'min': -100, 'max': 100},
+            'volume_change': {'min': -100, 'max': 100},
+            'bid_ask_spread': {'min': 0, 'max': 0.1},
+            'volatility': {'min': 0, 'max': 1}
+        }
+    )
 
-    # Periodic Model Configurations
-    PERIODIC_MODEL_CLASS = "RandomForestClassifier"  # Class name for the periodic model
-    N_ESTIMATORS = 100  # Number of trees in the Random Forest
-    MAX_DEPTH = None  # Maximum depth of trees in Random Forest
-    PERIODIC_MODEL_SAVE_PATH = "models/periodic_model.pkl"  # Path to save the periodic model
+class AIModelConfig(BaseModel):
+    model_config = ConfigDict(
+        env_file='.env',
+        env_file_encoding='utf-8',
+        case_sensitive=True,
+        validate_default=True
+    )
 
-    # Model Selector Configurations
-    MODEL_EVALUATION_INTERVAL = 3600  # Interval (in seconds) for model performance evaluation
-    MODEL_SELECTION_CRITERIA = "f1_score"  # Criteria used for dynamic model switching
+    # Model selection
+    MODEL_TYPE: Literal['SGD', 'PA'] = 'SGD'
+    BATCH_SIZE: int = Field(32, ge=1, le=1024)
+    LEARNING_RATE: float = Field(0.01, ge=0.0001, le=1.0)
+    LEARNING_RATE_SCHEDULE: Literal['optimal', 'adaptive', 'inverse_scaling'] = 'adaptive'
+    MIN_LEARNING_RATE: float = Field(1e-6, ge=1e-10, le=0.1)
+    LEARNING_RATE_DECAY: float = Field(0.1, ge=0.01, le=1.0)
 
-    # Data Preprocessing
-    FEATURE_SCALING = True  # Whether to apply feature scaling
-    SCALER_TYPE = "StandardScaler"  # Type of scaler used for feature scaling
+    # Model checkpointing
+    CHECKPOINT_INTERVAL: int = Field(1000, ge=100, le=10000)
+    MODEL_DIR: Path = Field(Path("models/checkpoints"))
+    
+    # Cross-validation
+    CV_SPLITS: int = Field(5, ge=2, le=10)
+    VALIDATION_WINDOW: int = Field(1000, ge=100, le=10000)
+    
+    # Feature preprocessing
+    SCALING_METHOD: Literal['standard', 'minmax', None] = 'standard'
+    NORMALIZATION: Literal['l1', 'l2', None] = 'l2'
+    FEATURE_CACHE_SIZE: int = Field(1000, ge=100, le=10000)
+    
+    # Performance metrics weights
+    METRIC_WEIGHTS: Dict[str, float] = Field(
+        default={
+            'accuracy': 0.3,
+            'precision': 0.3,
+            'recall': 0.2,
+            'f1': 0.2
+        }
+    )
 
-    # Training Intervals
-    ONLINE_TRAINING_INTERVAL = 60  # Interval (in seconds) between each online model update
-    PERIODIC_TRAINING_INTERVAL = 86400  # Interval (in seconds) for periodic model retraining
+    # Resource management
+    MAX_WORKERS: int = Field(4, ge=1, le=16)
+    MEMORY_LIMIT_MB: Optional[int] = Field(None, ge=128, le=32768)
+    
+    # Trading specific configurations
+    MIN_CONFIDENCE_THRESHOLD: float = Field(0.6, ge=0.5, le=1.0)
+    MAX_POSITION_HOLD_TIME: int = Field(3600, ge=60, le=86400)  # in seconds
+    MARKET_HOURS: Dict[str, Dict[str, int]] = Field(
+        default={
+            'default': {'start': 8, 'end': 22},
+            'weekend': {'start': 10, 'end': 20}
+        }
+    )
+    
+    # Feature configuration
+    FEATURE_CONFIG: ModelFeatureConfig = Field(default_factory=ModelFeatureConfig)
+    
+    # Market data validation
+    MARKET_DATA_SCHEMA: MarketDataSchema = Field(default_factory=MarketDataSchema)
 
-    # Data Settings
-    TRAINING_WINDOW_DAYS = 7  # Number of days to use for periodic training (rolling window)
-    MINI_BATCH_SIZE = 32  # Mini-batch size for online training
+    def __init__(self, **data):
+        super().__init__(**data)
+        self.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Logging
-    LOGGING_LEVEL = "INFO"  # Logging level for model training
+    @property
+    def model_path(self) -> Path:
+        """Returns the path for saving/loading the model."""
+        return self.MODEL_DIR / f"{self.MODEL_TYPE.lower()}_model.joblib"
 
-    # Miscellaneous
-    MAX_RETRIES = 3  # Maximum number of retries for any failed operation
+    @property
+    def checkpoint_path(self) -> Path:
+        """Returns the base path for model checkpoints."""
+        return self.MODEL_DIR / "checkpoints"
 
-    # Model Performance Thresholds
-    MIN_ACCURACY_THRESHOLD = 0.6  # Minimum accuracy required for model deployment
-    MIN_F1_THRESHOLD = 0.65  # Minimum F1 score required for model deployment
-    DRIFT_DETECTION_THRESHOLD = 0.1  # Maximum allowed drift before model retraining
+    @validator('METRIC_WEIGHTS')
+    def validate_metric_weights(cls, v):
+        if not abs(sum(v.values()) - 1.0) < 1e-6:
+            raise ValueError("Metric weights must sum to 1.0")
+        return v
 
-    # Cross-validation Settings
-    N_SPLITS = 5  # Number of folds for cross-validation
-    CV_SCORING = ['accuracy', 'f1', 'precision', 'recall']  # Metrics for cross-validation
+    def validate_market_data(self, data: Dict) -> bool:
+        """Validate market data against schema."""
+        try:
+            MarketDataSchema(**data)
+            return True
+        except Exception as e:
+            logger.error(f"Market data validation failed: {e}")
+            return False
 
-    # Feature Engineering
-    FEATURE_SELECTION_METHOD = "recursive"  # Method for feature selection
-    MAX_FEATURES = 20  # Maximum number of features to select
-    FEATURE_IMPORTANCE_THRESHOLD = 0.01  # Minimum importance threshold for feature selection
+    def get_feature_scaling_params(self, feature_name: str) -> Dict:
+        """Get scaling parameters for a feature."""
+        return self.FEATURE_CONFIG.feature_scaling.get(
+            feature_name,
+            {'min': -1, 'max': 1}  # Default scaling
+        )
 
-    # Model Versioning
-    MODEL_VERSION_FORMAT = "v{major}.{minor}.{patch}"  # Format for model versioning
-    AUTO_VERSION_INCREMENT = True  # Whether to automatically increment version on training
-    MODEL_REGISTRY_PATH = "models/registry"  # Path to store model versions
+    class Config:
+        validate_assignment = True
+        json_encoders = {
+            Path: str
+        }
 
-    # Monitoring Configurations
-    ENABLE_MONITORING = True  # Whether to enable model monitoring
-    MONITORING_METRICS = [  # List of metrics to monitor
-        "accuracy",
-        "latency",
-        "prediction_drift",
-        "feature_drift"
-    ]
-    MONITORING_INTERVAL = 300  # Interval (in seconds) for monitoring metrics collection
-    ALERT_THRESHOLD = 0.2  # Threshold for monitoring alerts
+# Global configuration instance
+config = AIModelConfig()

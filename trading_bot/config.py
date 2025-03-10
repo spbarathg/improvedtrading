@@ -9,7 +9,7 @@ from pydantic import (
 )
 from pydantic.networks import AnyUrl
 from pydantic.types import SecretStr, conint, confloat, constr
-from typing import Annotated, Literal, ClassVar
+from typing import Annotated, Literal, ClassVar, Dict
 from pathlib import Path
 import base58
 import re
@@ -34,7 +34,31 @@ PathWithAutoCreate = Annotated[
     BeforeValidator(lambda v: Path(v).parent.mkdir(parents=True, exist_ok=True))
 ]
 
+class ModelConfig(BaseModel):
+    """AI model configuration"""
+    
+    # Model performance settings
+    MAX_PREDICTIONS_PER_SECOND: conint(ge=1, le=100) = 10
+    MAX_CONCURRENT_PREDICTIONS: conint(ge=1, le=20) = 5
+    MAX_BURST_SIZE: conint(ge=1, le=50) = 20
+    
+    # Resource limits
+    MAX_MEMORY_USAGE_MB: conint(ge=100, le=10000) = 2000
+    MAX_CPU_USAGE_PCT: confloat(ge=10.0, le=90.0) = 70.0
+    
+    # Performance monitoring
+    METRICS_ENABLED: bool = True
+    METRICS_LOG_INTERVAL: conint(ge=1, le=3600) = 300  # seconds
+    METRICS_RETENTION_DAYS: conint(ge=1, le=365) = 30
+    
+    # Circuit breaker settings
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD: conint(ge=1, le=100) = 5
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT: conint(ge=1, le=3600) = 60  # seconds
+    CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT: conint(ge=1, le=1800) = 30  # seconds
+
 class Config(BaseModel):
+    """Main configuration with model validation"""
+    
     model_config = ConfigDict(
         env_file='.env',
         env_file_encoding='utf-8',
@@ -75,6 +99,9 @@ class Config(BaseModel):
     TRADING_ENABLED: bool = False
     LOG_LEVEL: LogLevel = "INFO"
     LOG_FILE: PathWithAutoCreate | None = Path("logs/trading_bot.log")
+    
+    # AI model configuration
+    MODEL: ModelConfig = ModelConfig()
     
     # Hidden calculated fields
     _rpc_rate_delay: ClassVar[float] = Field(1.0, exclude=True)

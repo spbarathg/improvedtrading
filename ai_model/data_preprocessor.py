@@ -1,138 +1,175 @@
 from sklearn.preprocessing import StandardScaler, Normalizer, MinMaxScaler
 import numpy as np
 import asyncio
+from functools import lru_cache
+import logging
+from typing import Tuple, Optional, Union
+import concurrent.futures
+
+logger = logging.getLogger(__name__)
 
 class DataPreprocessor:
     """
-    Handles data preprocessing for AI models asynchronously. This includes feature scaling,
-    label transformations, and various normalization techniques.
+    Enhanced data preprocessor with memory-efficient processing, caching, and better error handling.
     """
 
-    def __init__(self, scaling_method='standard', normalization=None):
+    def __init__(self, scaling_method='standard', normalization=None, cache_size=1000):
         """
         Initializes the DataPreprocessor with specified scaling and normalization methods.
         
         :param scaling_method: str, The scaling method to use ('standard', 'minmax', None)
         :param normalization: str, The normalization method to use ('l1', 'l2', None)
+        :param cache_size: int, Size of the LRU cache for feature processing
         """
-        # Initialize scalers and normalizers
         self.scaling_method = scaling_method
         self.normalization = normalization
+        self._validate_parameters()
         
-        # Scalers
-        self.standard_scaler = StandardScaler()
-        self.minmax_scaler = MinMaxScaler()
+        # Initialize scalers with better memory management
+        self.standard_scaler = StandardScaler(copy=False) if scaling_method == 'standard' else None
+        self.minmax_scaler = MinMaxScaler(copy=False) if scaling_method == 'minmax' else None
         
-        # Normalizers for L1 and L2
-        self.l1_normalizer = Normalizer(norm='l1')
-        self.l2_normalizer = Normalizer(norm='l2')
+        # Initialize normalizers with better memory management
+        self.l1_normalizer = Normalizer(norm='l1', copy=False) if normalization == 'l1' else None
+        self.l2_normalizer = Normalizer(norm='l2', copy=False) if normalization == 'l2' else None
         
-        # Store fitted state
         self.is_fitted = False
+        self._thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        
+    def _validate_parameters(self):
+        """Validates initialization parameters."""
+        valid_scaling = {'standard', 'minmax', None}
+        valid_norm = {'l1', 'l2', None}
+        
+        if self.scaling_method not in valid_scaling:
+            raise ValueError(f"Invalid scaling_method. Must be one of {valid_scaling}")
+        if self.normalization not in valid_norm:
+            raise ValueError(f"Invalid normalization. Must be one of {valid_norm}")
 
-    async def preprocess(self, features, labels, online_model=True):
-        """
-        Asynchronously preprocesses the features and labels for the AI models.
-        
-        :param features: Array of raw features from the data pipeline
-        :param labels: Array of labels (e.g., price movement classification)
-        :param online_model: Boolean indicating whether we are processing data for the online model
-        :return: Tuple (X_processed, y_processed) of preprocessed features and labels
-        """
-        # Process features asynchronously
-        X_scaled = await self._scale_features(features, online_model)
-        X_normalized = await self._normalize_features(X_scaled)
-        
-        # Transform labels (this is typically fast, so no need for async)
-        y_transformed = self._transform_labels(labels)
-        
-        return X_normalized, y_transformed
+    @lru_cache(maxsize=1000)
+    def _cache_key(self, features_tuple: Tuple) -> str:
+        """Generate cache key for feature arrays."""
+        return hash(features_tuple)
 
-    async def _scale_features(self, features, online_model):
+    async def preprocess(self, features: np.ndarray, labels: np.ndarray, 
+                        online_model: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Asynchronously scales the features using the specified scaling method.
+        Asynchronously preprocesses the features and labels with improved error handling.
         
-        :param features: Array of features to scale
-        :param online_model: Boolean indicating whether to use partial_fit
-        :return: Scaled features
+        :param features: Array of raw features
+        :param labels: Array of labels
+        :param online_model: Boolean for online model processing
+        :return: Tuple of preprocessed features and labels
+        """
+        try:
+            if not isinstance(features, np.ndarray) or not isinstance(labels, np.ndarray):
+                raise TypeError("Features and labels must be numpy arrays")
+
+            if features.size == 0 or labels.size == 0:
+                raise ValueError("Empty features or labels provided")
+
+            if features.shape[0] != labels.shape[0]:
+                raise ValueError("Features and labels must have the same number of samples")
+
+            # Process features asynchronously with better error handling
+            X_scaled = await self._scale_features(features, online_model)
+            X_normalized = await self._normalize_features(X_scaled)
+            
+            # Transform labels with validation
+            y_transformed = await asyncio.to_thread(self._transform_labels, labels)
+            
+            return X_normalized, y_transformed
+
+        except Exception as e:
+            logger.error(f"Error in preprocessing: {str(e)}")
+            raise
+
+    async def _scale_features(self, features: np.ndarray, online_model: bool) -> np.ndarray:
+        """
+        Memory-efficient feature scaling with improved error handling.
         """
         if self.scaling_method is None:
             return features
-            
-        # Use asyncio.to_thread for CPU-bound operations
-        if self.scaling_method == 'standard':
-            if online_model:
-                return await asyncio.to_thread(
-                    self.standard_scaler.partial_fit_transform, features
-                )
-            return await asyncio.to_thread(
-                self.standard_scaler.fit_transform if not self.is_fitted 
-                else self.standard_scaler.transform, features
-            )
-        elif self.scaling_method == 'minmax':
-            if online_model:
-                return await asyncio.to_thread(
-                    self.minmax_scaler.partial_fit_transform, features
-                )
-            return await asyncio.to_thread(
-                self.minmax_scaler.fit_transform if not self.is_fitted 
-                else self.minmax_scaler.transform, features
-            )
-        else:
-            raise ValueError(f"Unknown scaling method: {self.scaling_method}")
 
-    async def _normalize_features(self, features):
+        try:
+            scaler = self.standard_scaler if self.scaling_method == 'standard' else self.minmax_scaler
+            
+            if online_model:
+                return await asyncio.to_thread(
+                    lambda: scaler.partial_fit(features).transform(features)
+                )
+            
+            if not self.is_fitted:
+                result = await asyncio.to_thread(
+                    lambda: scaler.fit_transform(features)
+                )
+                self.is_fitted = True
+                return result
+            
+            return await asyncio.to_thread(
+                lambda: scaler.transform(features)
+            )
+
+        except Exception as e:
+            logger.error(f"Error in feature scaling: {str(e)}")
+            raise
+
+    async def _normalize_features(self, features: np.ndarray) -> np.ndarray:
         """
-        Asynchronously normalizes the features using the specified normalization method.
-        
-        :param features: Array of features to normalize
-        :return: Normalized features
+        Memory-efficient feature normalization with improved error handling.
         """
         if self.normalization is None:
             return features
-            
-        if self.normalization == 'l1':
-            return await asyncio.to_thread(self.l1_normalizer.fit_transform, features)
-        elif self.normalization == 'l2':
-            return await asyncio.to_thread(self.l2_normalizer.fit_transform, features)
-        else:
-            raise ValueError(f"Unknown normalization method: {self.normalization}")
 
-    def _transform_labels(self, labels):
+        try:
+            normalizer = self.l1_normalizer if self.normalization == 'l1' else self.l2_normalizer
+            return await asyncio.to_thread(normalizer.fit_transform, features)
+
+        except Exception as e:
+            logger.error(f"Error in feature normalization: {str(e)}")
+            raise
+
+    def _transform_labels(self, labels: np.ndarray) -> np.ndarray:
         """
-        Transforms raw labels into a multi-class format.
-        Example:
-        - "Win" -> 1 (for buy/sell opportunities)
-        - "Hold" -> 0 (no action needed)
-        - "Loss" -> -1 (indicates a potential sell)
+        Optimized label transformation with validation.
+        """
+        label_map = {"Win": 1, "Hold": 0, "Loss": -1}
         
-        :param labels: Array of raw labels
-        :return: Array of transformed labels
-        """
-        transformed_labels = np.array([self._label_to_class(label) for label in labels])
-        return transformed_labels
+        try:
+            if isinstance(labels[0], (str, bytes)):
+                transformed = np.array([label_map.get(label, None) for label in labels])
+                if None in transformed:
+                    invalid_labels = set(label for label in labels if label not in label_map)
+                    raise ValueError(f"Invalid labels found: {invalid_labels}")
+                return transformed
+            return labels  # Assume already transformed if not string labels
 
-    def _label_to_class(self, label):
-        """
-        Maps a label to its corresponding class.
-        :param label: String label
-        :return: Integer class label
-        """
-        if label == "Win":
-            return 1
-        elif label == "Hold":
-            return 0
-        elif label == "Loss":
-            return -1
-        else:
-            raise ValueError(f"Unknown label: {label}")
+        except Exception as e:
+            logger.error(f"Error in label transformation: {str(e)}")
+            raise
 
     async def reset(self):
         """
-        Asynchronously resets all scalers and normalizers.
+        Efficiently reset the preprocessor state.
         """
-        self.standard_scaler = StandardScaler()
-        self.minmax_scaler = MinMaxScaler()
-        self.l1_normalizer = Normalizer(norm='l1')
-        self.l2_normalizer = Normalizer(norm='l2')
-        self.is_fitted = False
+        try:
+            # Only recreate necessary objects based on configuration
+            if self.scaling_method == 'standard':
+                self.standard_scaler = StandardScaler(copy=False)
+            elif self.scaling_method == 'minmax':
+                self.minmax_scaler = MinMaxScaler(copy=False)
+            
+            if self.normalization == 'l1':
+                self.l1_normalizer = Normalizer(norm='l1', copy=False)
+            elif self.normalization == 'l2':
+                self.l2_normalizer = Normalizer(norm='l2', copy=False)
+            
+            self.is_fitted = False
+            
+        except Exception as e:
+            logger.error(f"Error resetting preprocessor: {str(e)}")
+            raise
+
+    def __del__(self):
+        """Cleanup resources."""
+        self._thread_pool.shutdown(wait=False)
