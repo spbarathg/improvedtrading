@@ -72,8 +72,9 @@ class DataStorage:
         'features': FeatureVector
     }
 
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
+    def __init__(self, config):
+        self.config = config
+        self.db_path = config.DATA_STORAGE_PATH
         self._pool: List[Connection] = []
         self._pool_lock = asyncio.Lock()
         self._max_pool_size = 10
@@ -89,6 +90,7 @@ class DataStorage:
         self._cache_stats = {'hits': 0, 'misses': 0}
         self._last_cache_cleanup = datetime.now()
         self._cache_cleanup_interval = timedelta(minutes=15)
+        logger.info("Initializing data storage with path: %s", self.db_path)
 
     async def _check_connections(self):
         """Check and clean up stale connections"""
@@ -150,59 +152,48 @@ class DataStorage:
 
     async def initialize(self):
         """Initialize database with optimized schema"""
-        feature_vector_size = getattr(config, 'FEATURE_VECTOR_SIZE', DEFAULT_FEATURE_VECTOR_SIZE)
-        async with self.connection() as conn:
-            await conn.executescript(f'''
-                CREATE TABLE IF NOT EXISTS raw_data (
-                    id INTEGER PRIMARY KEY,
-                    category TEXT NOT NULL,
-                    timestamp DATETIME NOT NULL,
-                    data BLOB NOT NULL,
-                    metadata BLOB,
-                    _compressed BOOLEAN DEFAULT 1
-                ) STRICT;
-
-                CREATE TABLE IF NOT EXISTS market_data (
-                    id INTEGER PRIMARY KEY,
-                    symbol TEXT NOT NULL,
-                    timestamp DATETIME NOT NULL,
-                    price REAL NOT NULL CHECK(price > 0),
-                    volume REAL NOT NULL CHECK(volume >= 0),
-                    metadata BLOB
-                ) STRICT;
-
-                CREATE TABLE IF NOT EXISTS social_metrics (
-                    id INTEGER PRIMARY KEY,
-                    source TEXT NOT NULL,
-                    timestamp DATETIME NOT NULL,
-                    metrics BLOB NOT NULL,
-                    metadata BLOB
-                ) STRICT;
-
-                CREATE TABLE IF NOT EXISTS features (
-                    id INTEGER PRIMARY KEY,
-                    timestamp DATETIME NOT NULL,
-                    values BLOB NOT NULL,
-                    metadata BLOB,
-                    CHECK(json_array_length(values) <= {feature_vector_size})
-                ) STRICT;
-
-                -- Optimized indexes for common query patterns
-                CREATE INDEX IF NOT EXISTS idx_raw_data_category_timestamp ON raw_data(category, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_market_data_symbol_timestamp ON market_data(symbol, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_social_source_timestamp ON social_metrics(source, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_features_timestamp ON features(timestamp);
-                
-                -- Partial indexes for frequently accessed recent data
-                CREATE INDEX IF NOT EXISTS idx_recent_raw_data ON raw_data(timestamp) 
-                    WHERE timestamp > datetime('now', '-1 day');
-                CREATE INDEX IF NOT EXISTS idx_recent_market_data ON market_data(timestamp) 
-                    WHERE timestamp > datetime('now', '-1 day');
-                CREATE INDEX IF NOT EXISTS idx_recent_social_metrics ON social_metrics(timestamp) 
-                    WHERE timestamp > datetime('now', '-1 day');
-                CREATE INDEX IF NOT EXISTS idx_recent_features ON features(timestamp) 
-                    WHERE timestamp > datetime('now', '-1 day');
-            ''')
+        logger.info("Initializing database schema")
+        try:
+            async with self.connection() as conn:
+                await conn.executescript('''
+                    CREATE TABLE IF NOT EXISTS market_data (
+                        id INTEGER PRIMARY KEY,
+                        pair TEXT NOT NULL,
+                        timestamp DATETIME NOT NULL,
+                        data BLOB NOT NULL,
+                        metadata BLOB
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS historical_data (
+                        id INTEGER PRIMARY KEY,
+                        pair TEXT NOT NULL,
+                        timestamp DATETIME NOT NULL,
+                        data BLOB NOT NULL,
+                        metadata BLOB
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS orderbook (
+                        id INTEGER PRIMARY KEY,
+                        pair TEXT NOT NULL,
+                        timestamp DATETIME NOT NULL,
+                        data BLOB NOT NULL,
+                        metadata BLOB
+                    );
+                    
+                    -- Indexes for better query performance
+                    CREATE INDEX IF NOT EXISTS idx_market_data_pair_time 
+                    ON market_data(pair, timestamp DESC);
+                    
+                    CREATE INDEX IF NOT EXISTS idx_historical_data_pair_time 
+                    ON historical_data(pair, timestamp DESC);
+                    
+                    CREATE INDEX IF NOT EXISTS idx_orderbook_pair_time 
+                    ON orderbook(pair, timestamp DESC);
+                ''')
+                logger.info("Database schema initialized successfully")
+        except Exception as e:
+            logger.error("Failed to initialize database schema: %s", str(e), exc_info=True)
+            raise
 
     def _compress(self, data: bytes) -> bytes:
         if not self._compression_enabled or len(data) < self._compression_threshold:
@@ -524,3 +515,135 @@ class DataStorage:
             stmt = self._get_prepared_statement('features', ['timestamp', 'values', 'metadata'])
             cursor = await self._execute(conn, stmt, values)
             return cursor.rowcount
+
+    async def store_market_data(self, market_data: Dict):
+        """Store current market data"""
+        try:
+            async with self.connection() as conn:
+                for pair, data in market_data.items():
+                    compressed_data = self._compress(orjson.dumps(data))
+                    await conn.execute(
+                        'INSERT INTO market_data (pair, timestamp, data) VALUES (?, ?, ?)',
+                        (pair, datetime.now().isoformat(), compressed_data)
+                    )
+                await conn.commit()
+                logger.debug("Stored market data for %d pairs", len(market_data))
+        except Exception as e:
+            logger.error("Failed to store market data: %s", str(e), exc_info=True)
+            raise
+
+    async def store_historical_data(self, pair: str, data: List[Dict]):
+        """Store historical market data"""
+        try:
+            async with self.connection() as conn:
+                for candle in data:
+                    compressed_data = self._compress(orjson.dumps(candle))
+                    await conn.execute(
+                        'INSERT INTO historical_data (pair, timestamp, data) VALUES (?, ?, ?)',
+                        (pair, candle['timestamp'], compressed_data)
+                    )
+                await conn.commit()
+                logger.info("Stored %d historical candles for %s", len(data), pair)
+        except Exception as e:
+            logger.error("Failed to store historical data for %s: %s", pair, str(e), exc_info=True)
+            raise
+
+    async def store_orderbook(self, pair: str, orderbook: Dict):
+        """Store orderbook data"""
+        try:
+            async with self.connection() as conn:
+                compressed_data = self._compress(orjson.dumps(orderbook))
+                await conn.execute(
+                    'INSERT INTO orderbook (pair, timestamp, data) VALUES (?, ?, ?)',
+                    (pair, orderbook['timestamp'], compressed_data)
+                )
+                await conn.commit()
+                logger.debug("Stored orderbook for %s", pair)
+        except Exception as e:
+            logger.error("Failed to store orderbook for %s: %s", pair, str(e), exc_info=True)
+            raise
+
+    async def get_latest_market_data(self, pair: str) -> Optional[Dict]:
+        """Get the most recent market data for a pair"""
+        try:
+            async with self.connection() as conn:
+                cursor = await conn.execute(
+                    'SELECT data FROM market_data WHERE pair = ? ORDER BY timestamp DESC LIMIT 1',
+                    (pair,)
+                )
+                row = await cursor.fetchone()
+                if row:
+                    data = orjson.loads(self._decompress(row[0]))
+                    logger.debug("Retrieved latest market data for %s", pair)
+                    return data
+                logger.warning("No market data found for %s", pair)
+                return None
+        except Exception as e:
+            logger.error("Failed to get latest market data for %s: %s", pair, str(e), exc_info=True)
+            return None
+
+    async def get_historical_data(self, pair: str, start_time: datetime, end_time: datetime) -> List[Dict]:
+        """Get historical data for a time range"""
+        try:
+            async with self.connection() as conn:
+                cursor = await conn.execute(
+                    '''SELECT data FROM historical_data 
+                       WHERE pair = ? AND timestamp BETWEEN ? AND ?
+                       ORDER BY timestamp ASC''',
+                    (pair, start_time.isoformat(), end_time.isoformat())
+                )
+                rows = await cursor.fetchall()
+                data = [orjson.loads(self._decompress(row[0])) for row in rows]
+                logger.info("Retrieved %d historical records for %s", len(data), pair)
+                return data
+        except Exception as e:
+            logger.error("Failed to get historical data for %s: %s", pair, str(e), exc_info=True)
+            return []
+
+    async def get_latest_orderbook(self, pair: str) -> Optional[Dict]:
+        """Get the most recent orderbook for a pair"""
+        try:
+            async with self.connection() as conn:
+                cursor = await conn.execute(
+                    'SELECT data FROM orderbook WHERE pair = ? ORDER BY timestamp DESC LIMIT 1',
+                    (pair,)
+                )
+                row = await cursor.fetchone()
+                if row:
+                    data = orjson.loads(self._decompress(row[0]))
+                    logger.debug("Retrieved latest orderbook for %s", pair)
+                    return data
+                logger.warning("No orderbook found for %s", pair)
+                return None
+        except Exception as e:
+            logger.error("Failed to get latest orderbook for %s: %s", pair, str(e), exc_info=True)
+            return None
+
+    async def cleanup_old_data(self, days: int = 7):
+        """Remove data older than specified days"""
+        try:
+            cutoff_time = (datetime.now() - timedelta(days=days)).isoformat()
+            async with self.connection() as conn:
+                for table in ['market_data', 'historical_data', 'orderbook']:
+                    result = await conn.execute(
+                        f'DELETE FROM {table} WHERE timestamp < ?',
+                        (cutoff_time,)
+                    )
+                    deleted = result.rowcount
+                    await conn.commit()
+                    logger.info("Cleaned up %d old records from %s", deleted, table)
+        except Exception as e:
+            logger.error("Failed to cleanup old data: %s", str(e), exc_info=True)
+            raise
+
+    async def close(self):
+        """Close all database connections"""
+        try:
+            async with self._pool_lock:
+                for conn in self._pool:
+                    await conn.close()
+                self._pool.clear()
+            logger.info("Closed all database connections")
+        except Exception as e:
+            logger.error("Error closing database connections: %s", str(e), exc_info=True)
+            raise

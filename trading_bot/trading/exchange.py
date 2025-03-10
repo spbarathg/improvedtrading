@@ -2,7 +2,6 @@ import asyncio
 import aiohttp
 import base64
 import json
-import logging
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from solana.rpc.async_api import AsyncClient
@@ -14,15 +13,36 @@ from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import orjson
 from prometheus_client import Counter, Histogram, Gauge
-from typing import Dict, Optional, List, Set, DefaultDict
+from typing import Dict, Optional, List, Set, DefaultDict, Tuple, Any
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from functools import lru_cache
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 import time
+import logging
 
 logger = logging.getLogger(__name__)
+
+class ExchangeError(Exception):
+    """Base exception for exchange-related errors"""
+    pass
+
+class QuoteError(ExchangeError):
+    """Error when fetching quotes"""
+    pass
+
+class SwapError(ExchangeError):
+    """Error during swap execution"""
+    pass
+
+class BalanceError(ExchangeError):
+    """Error when fetching or updating balances"""
+    pass
+
+class CircuitBreakerError(ExchangeError):
+    """Error when circuit breaker is triggered"""
+    pass
 
 @dataclass(slots=True, frozen=True)
 class OrderStatus:
@@ -43,303 +63,565 @@ class Exchange:
     _BATCH_SIZE = 10
     _CACHE_TTL = 30  # Reduced from 60 to complement DataStorage
     _CACHE_SIZE = 5_000  # Reduced from 10_000 to complement DataStorage
+    _MAX_RETRIES = 3
+    _RETRY_DELAY = 1  # seconds
     
     def __init__(self, config):
-        self.config = config
-        self._signer = Keypair.from_secret_key(base64.b64decode(config.PRIVATE_KEY))
-        self._pubkey = str(self._signer.public_key)
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Initializing Exchange")
         
-        # Optimized connection pools with connection limits
-        self.solana = AsyncClient(
-            config.SOLANA_RPC_URL,
-            timeout=30,
-            commitment="confirmed",
-            max_connections=self._MAX_CONNECTIONS
+        self.config = config
+        self.client = AsyncClient(config.SOLANA_RPC_URL)
+        
+        # Initialize rate limiters
+        self.rpc_limiter = AsyncLimiter(
+            config.RPC_RATE_LIMIT,
+            time_period=1.0
+        )
+        self.jupiter_limiter = AsyncLimiter(
+            config.JUPITER_RATE_LIMIT,
+            time_period=1.0
         )
         
-        # Connection pooling with keep-alive
-        self.jupiter = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15),
-            json_serialize=orjson.dumps,
+        # Initialize connection pool
+        self.session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
                 limit=self._MAX_CONNECTIONS,
-                ttl_dns_cache=300,
-                use_dns_cache=True,
-                enable_cleanup_closed=True
+                ttl_dns_cache=300
             )
         )
         
-        # Rate limiting with adaptive limits
-        self.limiter = {
-            'solana': AsyncLimiter(config.RPC_RATE_LIMIT),
-            'jupiter': AsyncLimiter(config.JUPITER_RATE_LIMIT)
+        # Initialize circuit breaker state
+        self._circuit_breakers = {
+            'rpc': {'failures': 0, 'last_failure': None},
+            'jupiter': {'failures': 0, 'last_failure': None}
         }
         
-        # Memory-efficient state management with LRU cache
-        self.orders: Dict[str, OrderStatus] = {}
-        self._state_lock = asyncio.Lock()
-        self._last_state_save = asyncio.Event()
-        self._batch_queue: DefaultDict[str, List] = defaultdict(list)
-        self._batch_locks: Dict[str, asyncio.Lock] = {}
-        
-        # Thread pool for CPU-bound tasks
-        self._thread_pool = ThreadPoolExecutor(max_workers=4)
-        
-        # Circuit breaker state
-        self._circuit_breaker = {
-            'solana': {'failures': 0, 'last_failure': 0},
-            'jupiter': {'failures': 0, 'last_failure': 0}
-        }
-        
-        # Performance metrics with labels
+        # Initialize metrics
         self.metrics = {
-            'requests': Counter('exchange_requests', 'API requests', ['service', 'status', 'endpoint']),
-            'latency': Histogram('exchange_latency', 'Request latency', ['service', 'operation']),
-            'orders': Gauge('exchange_orders', 'Active orders', ['status']),
-            'balance': Gauge('exchange_balance', 'Current balance'),
-            'batch_size': Histogram('exchange_batch_size', 'Batch operation size'),
-            'circuit_breaker': Gauge('exchange_circuit_breaker', 'Circuit breaker state', ['service']),
-            'cache_hits': Counter('exchange_cache_hits', 'Cache hits'),
-            'cache_misses': Counter('exchange_cache_misses', 'Cache misses')
+            'quotes_total': Counter('exchange_quotes_total', 'Total quote requests'),
+            'swaps_total': Counter('exchange_swaps_total', 'Total swap executions'),
+            'quote_latency': Histogram('exchange_quote_latency', 'Quote request latency'),
+            'swap_latency': Histogram('exchange_swap_latency', 'Swap execution latency'),
+            'balance_checks': Counter('exchange_balance_checks', 'Total balance checks'),
+            'errors': Counter('exchange_errors_total', 'Total errors', ['type']),
+            'circuit_breaks': Counter('exchange_circuit_breaks', 'Circuit breaker activations', ['service'])
         }
         
-        # Weak reference cache for frequently accessed data
-        self._cache = weakref.WeakValueDictionary()
-        self._cache_timestamps = {}
+        # Initialize state
+        self._running = False
+        self._tasks = set()
+        self._last_state_save = time.time()
+        
+        self.logger.info("Exchange initialized",
+                      rpc_url=config.SOLANA_RPC_URL,
+                      rpc_rate_limit=config.RPC_RATE_LIMIT,
+                      jupiter_rate_limit=config.JUPITER_RATE_LIMIT,
+                      max_connections=self._MAX_CONNECTIONS)
+        
+        try:
+            self._signer = Keypair.from_secret_key(base64.b64decode(config.PRIVATE_KEY))
+            self._pubkey = str(self._signer.public_key)
+            self._executor = ThreadPoolExecutor(max_workers=4)
+            self._cache: Dict[str, Tuple[Any, float]] = {}  # (value, expiry)
+            self._last_errors: DefaultDict[str, List[float]] = defaultdict(list)
+            
+            # Metrics
+            self.request_latency = Histogram(
+                'exchange_request_latency_seconds',
+                'Request latency in seconds',
+                ['service', 'operation']
+            )
+            self.error_counter = Counter(
+                'exchange_errors_total',
+                'Total number of exchange errors',
+                ['service', 'error_type']
+            )
+            self.circuit_breaker_status = Gauge(
+                'exchange_circuit_breaker_status',
+                'Circuit breaker status (0=closed, 1=open)',
+                ['service']
+            )
+            
+            logger.info("Exchange initialized successfully")
+        except Exception as e:
+            logger.exception("Failed to initialize Exchange")
+            raise ExchangeError(f"Exchange initialization failed: {str(e)}") from e
+
+    async def start(self):
+        try:
+            if self._running:
+                logger.warning("Exchange is already running")
+                return
+
+            self._running = True
+            self._tasks.extend([
+                asyncio.create_task(self._save_state()),
+                asyncio.create_task(self._cleanup())
+            ])
+            logger.info("Exchange started successfully")
+        except Exception as e:
+            logger.exception("Failed to start Exchange")
+            raise ExchangeError("Exchange start failed") from e
+
+    async def stop(self):
+        try:
+            self._running = False
+            for task in self._tasks:
+                task.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            
+            if self.session and not self.session.closed:
+                await self.session.close()
+            
+            await self.client.close()
+            self._executor.shutdown(wait=True)
+            logger.info("Exchange stopped successfully")
+        except Exception as e:
+            logger.exception("Error during Exchange shutdown")
+            raise ExchangeError("Exchange stop failed") from e
 
     @lru_cache(maxsize=1000)
     def _get_cached_balance(self) -> float:
-        """Cached balance check with TTL"""
-        current_time = time.time()
-        if 'balance' in self._cache and current_time - self._cache_timestamps.get('balance', 0) < self._CACHE_TTL:
-            return self._cache['balance']
-        return 0.0
-
-    async def _circuit_breaker_check(self, service: str) -> bool:
-        """Circuit breaker implementation with exponential backoff"""
-        state = self._circuit_breaker[service]
-        current_time = time.time()
-        
-        if state['failures'] >= 5:
-            if current_time - state['last_failure'] < 2 ** state['failures']:
-                self.metrics['circuit_breaker'].labels(service=service).set(0)
-                return False
-            state['failures'] = 0
-            self.metrics['circuit_breaker'].labels(service=service).set(1)
-        return True
-
-    async def _batch_process(self, service: str, operation: str, items: List):
-        """Efficient batch processing with size limits"""
-        if len(items) == 0:
-            return []
-            
-        batch_size = min(len(items), self._BATCH_SIZE)
-        self.metrics['batch_size'].observe(batch_size)
-        
-        async with self._batch_locks.setdefault(service, asyncio.Lock()):
-            results = await asyncio.gather(*[
-                self._request(operation, item, service)
-                for item in items[:batch_size]
-            ])
-            
-        return results
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1),
-        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
-    )
-    async def _request(self, method: str, url: str, service: str, **kwargs):
-        """Optimized request handling with circuit breaker and metrics"""
-        if not await self._circuit_breaker_check(service):
-            raise Exception(f"Circuit breaker open for {service}")
-            
-        async with self.limiter[service]:
-            start = datetime.now()
-            try:
-                async with getattr(self.jupiter, method)(url, **kwargs) as resp:
-                    data = await resp.json(loads=orjson.loads)
-                    self.metrics['requests'].labels(
-                        service=service,
-                        status='success',
-                        endpoint=url.split('/')[-1]
-                    ).inc()
-                    self.metrics['latency'].labels(
-                        service=service,
-                        operation=method
-                    ).observe((datetime.now() - start).total_seconds())
-                    return data
-            except Exception as e:
-                self._circuit_breaker[service]['failures'] += 1
-                self._circuit_breaker[service]['last_failure'] = time.time()
-                self.metrics['requests'].labels(
-                    service=service,
-                    status='error',
-                    endpoint=url.split('/')[-1]
-                ).inc()
-                logger.error('Request failed: %s', e)
-                raise
-
-    async def get_balance(self):
-        """Optimized balance check with caching and circuit breaker"""
         try:
-            cached_balance = self._get_cached_balance()
-            if cached_balance > 0:
-                return cached_balance
-                
-            result = await self.solana.get_balance(PublicKey(self._pubkey))
-            balance = result['result']['value'] / 1e9
-            self._cache['balance'] = balance
-            self._cache_timestamps['balance'] = time.time()
-            self.metrics['balance'].set(balance)
-            return balance
-        except Exception as e:
-            logger.error('Balance check failed: %s', e)
+            return float(self._cache.get("balance", (0.0, 0))[0])
+        except (TypeError, ValueError) as e:
+            logger.error(f"Error retrieving cached balance: {str(e)}", exc_info=True)
             return 0.0
 
-    async def get_quote(self, input_mint: str, output_mint: str, amount: int):
-        """Batch-capable quote fetching with caching"""
-        cache_key = f"quote_{input_mint}_{output_mint}_{amount}"
-        if cache_key in self._cache and time.time() - self._cache_timestamps.get(cache_key, 0) < self._CACHE_TTL:
-            return self._cache[cache_key]
-            
-        params = {
-            'inputMint': input_mint,
-            'outputMint': output_mint,
-            'amount': amount,
-            'slippageBps': self.config.SLIPPAGE_BPS
-        }
-        result = await self._request('get', '/quote', 'jupiter', params=params)
-        self._cache[cache_key] = result
-        self._cache_timestamps[cache_key] = time.time()
-        return result
-
-    async def get_swap_tx(self, quote: dict):
-        """Transaction preparation with pre-signed headers"""
-        return await self._request('post', '/swap', 'jupiter', json={
-            'quoteResponse': quote,
-            'userPublicKey': self._pubkey,
-            'wrapUnwrapSOL': True
-        })
-
-    async def execute_swap(self, input_mint: str, output_mint: str, amount: int):
-        """Optimized swap execution pipeline with batching"""
+    async def _circuit_breaker_check(self, service: str) -> bool:
         try:
-            # Phase 1: Get quote with caching
-            quote = await self.get_quote(input_mint, output_mint, amount)
-            if not quote:
-                return None
-
-            # Phase 2: Prepare transaction
-            tx_data = await self.get_swap_tx(quote)
-            if not tx_data:
-                return None
-
-            # Phase 3: Sign and send with optimized serialization
-            tx = Transaction.deserialize(tx_data['transaction'])
-            tx.sign(self._signer)
+            now = time.time()
+            self._last_errors[service] = [t for t in self._last_errors[service] if now - t < 60]
             
-            # Async confirmation with timeout
-            sig = await asyncio.wait_for(
-                self.solana.send_transaction(tx),
-                timeout=30
-            )
-            sig = sig.get('result')
-            if not sig:
-                return None
-
-            # Track order with atomic update
-            async with self._state_lock:
-                self.orders[sig] = OrderStatus(
-                    order_id=sig,
-                    status='pending',
-                    created_at=datetime.now(),
-                    updated_at=datetime.now(),
-                    amount=amount,
-                    price=quote.get('price', 0),
-                    type='swap'
-                )
-                self.metrics['orders'].labels(status='pending').inc()
-
-            # Phase 4: Wait for confirmation with timeout
-            try:
-                await asyncio.wait_for(
-                    self.solana.confirm_transaction(sig),
-                    timeout=60
-                )
-                # Update order status
-                async with self._state_lock:
-                    if sig in self.orders:
-                        self.orders[sig].status = 'completed'
-                        self.orders[sig].updated_at = datetime.now()
-                        self.metrics['orders'].labels(status='completed').inc()
-                return sig
-            except asyncio.TimeoutError:
-                # Update order status
-                async with self._state_lock:
-                    if sig in self.orders:
-                        self.orders[sig].status = 'timeout'
-                        self.orders[sig].updated_at = datetime.now()
-                        self.orders[sig].error = 'Transaction confirmation timeout'
-                        self.metrics['orders'].labels(status='timeout').inc()
-                return None
-
+            if len(self._last_errors[service]) >= 5:  # 5 errors in 1 minute
+                self._circuit_breakers[service]['failures'] = now + 300  # Open for 5 minutes
+                self.circuit_breaker_status.labels(service=service).set(1)
+                logger.warning(f"Circuit breaker opened for {service}")
+                return True
+            
+            if self._circuit_breakers[service]['failures'] > now:
+                return True
+                
+            self.circuit_breaker_status.labels(service=service).set(0)
+            return False
         except Exception as e:
-            logger.error('Swap execution failed: %s', e)
-            return None
+            logger.error(f"Error in circuit breaker check for {service}: {str(e)}", exc_info=True)
+            return True  # Fail safe: assume circuit is open on error
+
+    async def _request(self, method: str, url: str, service: str, **kwargs) -> Tuple[Any, bool]:
+        """Make HTTP request with comprehensive error handling"""
+        if not self.session:
+            raise ExchangeError("Session not initialized")
+
+        if await self._circuit_breaker_check(service):
+            raise CircuitBreakerError(f"Circuit breaker is open for {service}")
+
+        start_time = time.time()
+        try:
+            async with self.rpc_limiter:
+                async with self.session.request(method, url, **kwargs) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    self.request_latency.labels(
+                        service=service,
+                        operation=method
+                    ).observe(time.time() - start_time)
+                    
+                    return data, True
+
+        except aiohttp.ClientError as e:
+            self.error_counter.labels(service=service, error_type="http").inc()
+            self._last_errors[service].append(time.time())
+            logger.error(f"HTTP error for {service} at {url}: {str(e)}", exc_info=True)
+            return None, False
+            
+        except asyncio.TimeoutError:
+            self.error_counter.labels(service=service, error_type="timeout").inc()
+            self._last_errors[service].append(time.time())
+            logger.error(f"Timeout for {service} at {url}", exc_info=True)
+            return None, False
+            
+        except Exception as e:
+            self.error_counter.labels(service=service, error_type="unknown").inc()
+            self._last_errors[service].append(time.time())
+            logger.exception(f"Unexpected error for {service} at {url}")
+            return None, False
+
+    async def get_balance(self) -> float:
+        """Get account balance with caching and error handling"""
+        try:
+            cache_key = f"balance_{self._pubkey}"
+            now = time.time()
+            
+            # Check cache
+            if cache_key in self._cache:
+                value, expiry = self._cache[cache_key]
+                if now < expiry:
+                    return float(value)
+            
+            # Fetch fresh balance
+            response = await self.client.get_balance(self._pubkey)
+            if not response or "value" not in response["result"]:
+                raise BalanceError("Invalid response from get_balance")
+                
+            balance = float(response["result"]["value"]) / 1e9  # Convert lamports to SOL
+            self._cache[cache_key] = (balance, now + self._CACHE_TTL)
+            return balance
+            
+        except Exception as e:
+            logger.exception("Error fetching balance")
+            self.error_counter.labels(service="solana", error_type="balance").inc()
+            raise BalanceError(f"Failed to get balance: {str(e)}") from e
+
+    async def get_quote(self, input_mint: str, output_mint: str, amount: int) -> Dict:
+        """Get swap quote with error handling"""
+        try:
+            url = f"{self._JUPITER_API}/quote"
+            params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount),
+                "slippageBps": self.config.SLIPPAGE_BPS
+            }
+            
+            data, success = await self._request(
+                "GET", url, "jupiter", params=params
+            )
+            
+            if not success or not data:
+                raise QuoteError("Failed to fetch quote")
+                
+            return data
+            
+        except CircuitBreakerError as e:
+            logger.warning(str(e))
+            raise QuoteError("Service temporarily unavailable") from e
+        except Exception as e:
+            logger.exception("Error getting quote")
+            raise QuoteError(f"Quote fetch failed: {str(e)}") from e
+
+    async def get_swap_tx(self, quote: dict) -> Transaction:
+        """Get swap transaction with error handling"""
+        try:
+            url = f"{self._JUPITER_API}/swap"
+            data, success = await self._request(
+                "POST",
+                url,
+                "jupiter",
+                json={
+                    "quoteResponse": quote,
+                    "userPublicKey": self._pubkey,
+                    "wrapUnwrapSOL": True
+                }
+            )
+            
+            if not success or not data or "swapTransaction" not in data:
+                raise SwapError("Invalid swap transaction response")
+                
+            return Transaction.deserialize(base64.b64decode(data["swapTransaction"]))
+            
+        except Exception as e:
+            logger.exception("Error getting swap transaction")
+            raise SwapError(f"Failed to get swap transaction: {str(e)}") from e
+
+    async def execute_swap(self, input_mint: str, output_mint: str, amount: int) -> OrderStatus:
+        """Execute swap with comprehensive error handling and monitoring"""
+        start_time = time.time()
+        order_id = f"swap_{int(start_time)}_{input_mint}_{output_mint}"
+        
+        try:
+            # Get quote
+            quote = await self.get_quote(input_mint, output_mint, amount)
+            
+            # Get transaction
+            transaction = await self.get_swap_tx(quote)
+            
+            # Sign and send transaction
+            transaction.sign(self._signer)
+            opts = TxOpts(skip_preflight=True)
+            
+            response = await self.client.send_transaction(
+                transaction,
+                self._signer,
+                opts=opts
+            )
+            
+            if "result" not in response:
+                raise SwapError("Invalid transaction response")
+                
+            signature = response["result"]
+            
+            # Monitor transaction
+            status = await self.client.confirm_transaction(signature)
+            if not status or not status.get("result", {}).get("value", False):
+                raise SwapError("Transaction failed to confirm")
+            
+            # Record metrics
+            self.request_latency.labels(
+                service="swap",
+                operation="complete"
+            ).observe(time.time() - start_time)
+            
+            return OrderStatus(
+                order_id=order_id,
+                status="completed",
+                created_at=datetime.fromtimestamp(start_time),
+                updated_at=datetime.now(),
+                amount=amount,
+                price=float(quote["price"]),
+                type="swap"
+            )
+            
+        except (QuoteError, SwapError) as e:
+            logger.error(f"Swap failed: {str(e)}", exc_info=True)
+            self.error_counter.labels(service="swap", error_type="execution").inc()
+            return OrderStatus(
+                order_id=order_id,
+                status="failed",
+                created_at=datetime.fromtimestamp(start_time),
+                updated_at=datetime.now(),
+                amount=amount,
+                price=0.0,
+                type="swap",
+                error=str(e)
+            )
+            
+        except Exception as e:
+            logger.exception("Unexpected error during swap execution")
+            self.error_counter.labels(service="swap", error_type="unknown").inc()
+            return OrderStatus(
+                order_id=order_id,
+                status="error",
+                created_at=datetime.fromtimestamp(start_time),
+                updated_at=datetime.now(),
+                amount=amount,
+                price=0.0,
+                type="swap",
+                error=f"Unexpected error: {str(e)}"
+            )
 
     async def _save_state(self):
-        """Periodic state persistence with atomic updates"""
-        while True:
+        """Periodic state saving with error handling"""
+        while self._running:
             try:
-                async with self._state_lock:
-                    # Save orders state
-                    state = {
-                        'orders': {
-                            order_id: {
-                                'status': order.status,
-                                'created_at': order.created_at.isoformat(),
-                                'updated_at': order.updated_at.isoformat(),
-                                'amount': order.amount,
-                                'price': order.price,
-                                'type': order.type,
-                                'error': order.error
-                            }
-                            for order_id, order in self.orders.items()
-                        }
-                    }
-                    
-                    # Save to file with atomic write
-                    with open('exchange_state.json', 'w') as f:
-                        orjson.dump(state, f)
-                    
-                    self._last_state_save.set()
-                    logger.debug('State saved successfully')
-                    
+                # Save critical state
+                state = {
+                    "circuit_breakers": dict(self._circuit_breakers),
+                    "last_errors": {k: list(v) for k, v in self._last_errors.items()},
+                    "cache": {k: list(v) for k, v in self._cache.items()}
+                }
+                
+                await self.client.send_transaction(
+                    Transaction().add(
+                        memo_program.create_memo_instruction(
+                            orjson.dumps(state).decode()
+                        )
+                    ),
+                    self._signer
+                )
+                
+                logger.debug("State saved successfully")
+                await asyncio.sleep(self._STATE_SAVE_INTERVAL)
+                
             except Exception as e:
-                logger.error('State save failed: %s', e)
-            
-            await asyncio.sleep(self._STATE_SAVE_INTERVAL)
+                logger.error(f"Error saving state: {str(e)}", exc_info=True)
+                await asyncio.sleep(60)  # Retry after 1 minute on error
 
     async def _cleanup(self):
-        """Resource cleanup with graceful shutdown"""
+        """Periodic cleanup with error handling"""
+        while self._running:
+            try:
+                now = time.time()
+                
+                # Clean up cache
+                expired_keys = [
+                    k for k, (_, expiry) in self._cache.items()
+                    if now > expiry
+                ]
+                for k in expired_keys:
+                    del self._cache[k]
+                
+                # Clean up circuit breakers
+                expired_breakers = [
+                    k for k, v in self._circuit_breakers.items()
+                    if now > v
+                ]
+                for k in expired_breakers:
+                    del self._circuit_breakers[k]
+                    self.circuit_breaker_status.labels(service=k).set(0)
+                
+                # Clean up error history
+                for service in list(self._last_errors.keys()):
+                    self._last_errors[service] = [
+                        t for t in self._last_errors[service]
+                        if now - t < 3600  # Keep last hour
+                    ]
+                
+                logger.debug("Cleanup completed successfully")
+                await asyncio.sleep(self._HEALTH_CHECK_INTERVAL)
+                
+            except Exception as e:
+                logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
+                await asyncio.sleep(60)  # Retry after 1 minute on error
+
+    async def connect(self):
+        """Establish connection to the exchange"""
         try:
-            # Cancel pending tasks
-            for task in asyncio.all_tasks():
-                if task is not asyncio.current_task():
-                    task.cancel()
-            
-            # Close connections
-            await self.jupiter.close()
-            await self.solana.close()
-            
-            # Shutdown thread pool
-            self._thread_pool.shutdown(wait=True)
-            
-            # Save final state
-            await self._save_state()
-            
-            logger.info('Cleanup completed successfully')
-            
+            if self.session is None or self.session.closed:
+                self.session = aiohttp.ClientSession(
+                    base_url=str(self.config.SOLANA_RPC_URL),
+                    timeout=aiohttp.ClientTimeout(total=30)
+                )
+                logger.info("Successfully established exchange connection")
+            return True
         except Exception as e:
-            logger.error('Cleanup failed: %s', e)
+            logger.error(f"Failed to establish exchange connection: {str(e)}", exc_info=True)
+            return False
+
+    async def close(self):
+        """Close exchange connection"""
+        try:
+            if self.session and not self.session.closed:
+                await self.session.close()
+                logger.info("Exchange connection closed")
+        except Exception as e:
+            logger.error(f"Error closing exchange connection: {str(e)}", exc_info=True)
+
+    async def check_connection(self) -> bool:
+        """Check if the exchange connection is alive"""
+        try:
+            if not self.session or self.session.closed:
+                logger.warning("Exchange connection not established or closed")
+                return await self.connect()
+            
+            # Ping exchange
+            async with self.session.get("/health") as response:
+                if response.status == 200:
+                    logger.debug("Exchange connection check successful")
+                    return True
+                else:
+                    logger.warning(f"Exchange health check failed with status {response.status}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Exchange connection check failed: {str(e)}", exc_info=True)
+            return False
+
+    async def reconnect(self):
+        """Attempt to reconnect to the exchange"""
+        logger.info("Attempting to reconnect to exchange")
+        self.connection_retries += 1
+        
+        if self.connection_retries > self.MAX_RETRIES:
+            logger.error(f"Max reconnection attempts ({self.MAX_RETRIES}) exceeded")
+            raise ConnectionError("Failed to reconnect to exchange after maximum retries")
+            
+        try:
+            await self.close()
+            success = await self.connect()
+            if success:
+                self.connection_retries = 0
+                logger.info("Successfully reconnected to exchange")
+                return True
+            else:
+                logger.warning(f"Reconnection attempt {self.connection_retries} failed")
+                return False
+        except Exception as e:
+            logger.error(f"Error during reconnection attempt: {str(e)}", exc_info=True)
+            return False
+
+    async def measure_latency(self) -> float:
+        """Measure exchange latency"""
+        try:
+            start_time = datetime.now()
+            await self.check_connection()
+            latency = (datetime.now() - start_time).total_seconds() * 1000
+            logger.debug(f"Exchange latency: {latency:.2f}ms")
+            return latency
+        except Exception as e:
+            logger.error(f"Error measuring exchange latency: {str(e)}", exc_info=True)
+            return -1
+
+    async def get_market_price(self, symbol: str) -> Optional[float]:
+        """Get current market price for a symbol"""
+        try:
+            if not await self.check_connection():
+                logger.error("Cannot get market price: Exchange connection failed")
+                return None
+                
+            async with self.session.get(f"/v1/market/{symbol}/price") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    price = float(data['price'])
+                    logger.debug(f"Retrieved market price for {symbol}: {price}")
+                    return price
+                else:
+                    logger.warning(f"Failed to get market price for {symbol}: Status {response.status}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error getting market price for {symbol}: {str(e)}", exc_info=True)
+            return None
+
+    async def place_order(self, order: Dict) -> Optional[Dict]:
+        """Place an order on the exchange"""
+        try:
+            if not await self.check_connection():
+                logger.error("Cannot place order: Exchange connection failed")
+                return None
+                
+            logger.info(f"Placing order: {order}")
+            async with self.session.post("/v1/order", json=order) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    logger.info(f"Order placed successfully: {result['order_id']}")
+                    return result
+                else:
+                    logger.warning(f"Failed to place order: Status {response.status}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error placing order: {str(e)}", exc_info=True)
+            return None
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an existing order"""
+        try:
+            if not await self.check_connection():
+                logger.error("Cannot cancel order: Exchange connection failed")
+                return False
+                
+            logger.info(f"Cancelling order: {order_id}")
+            async with self.session.delete(f"/v1/order/{order_id}") as response:
+                success = response.status == 200
+                if success:
+                    logger.info(f"Order {order_id} cancelled successfully")
+                else:
+                    logger.warning(f"Failed to cancel order {order_id}: Status {response.status}")
+                return success
+                
+        except Exception as e:
+            logger.error(f"Error cancelling order {order_id}: {str(e)}", exc_info=True)
+            return False
+
+    async def get_order_status(self, order_id: str) -> Optional[Dict]:
+        """Get the status of an order"""
+        try:
+            if not await self.check_connection():
+                logger.error("Cannot get order status: Exchange connection failed")
+                return None
+                
+            async with self.session.get(f"/v1/order/{order_id}") as response:
+                if response.status == 200:
+                    status = await response.json()
+                    logger.debug(f"Retrieved status for order {order_id}: {status['status']}")
+                    return status
+                else:
+                    logger.warning(f"Failed to get status for order {order_id}: Status {response.status}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error getting status for order {order_id}: {str(e)}", exc_info=True)
+            return None

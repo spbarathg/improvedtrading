@@ -6,6 +6,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 from trading_bot.utils.decorators import error_handler
+import aiosqlite
+import orjson
+import zstandard as zstd
+from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +23,18 @@ class DataManager:
         self.metadata_file = self.version_dir / 'metadata.json'
         self.retention_days = getattr(config, 'DATA_RETENTION_DAYS', 30)
         self.max_versions = getattr(config, 'MAX_DATA_VERSIONS', 5)
+        self.db_path = config.DATA_STORAGE_PATH
+        self._cache = TTLCache(maxsize=10_000, ttl=300)  # 5 minutes cache
+        self._compressor = zstd.ZstdCompressor(level=3)
+        self._decompressor = zstd.ZstdDecompressor()
         
         # Create necessary directories
         self.version_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize or load metadata
         self._metadata = self._load_metadata()
+        
+        logger.info("Initializing data manager with path: %s", self.db_path)
         
     def _load_metadata(self) -> Dict:
         """Load version metadata from file."""
@@ -143,4 +153,96 @@ class DataManager:
         for version in self._metadata['versions']:
             if version['id'] == version_id:
                 return version
-        return None 
+        return None
+
+    async def initialize(self):
+        """Initialize database schema"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS market_data (
+                        id INTEGER PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        timestamp DATETIME NOT NULL,
+                        data BLOB NOT NULL,
+                        metadata BLOB
+                    );
+                    
+                    CREATE INDEX IF NOT EXISTS idx_market_data_symbol_time 
+                    ON market_data(symbol, timestamp DESC);
+                ''')
+                await db.commit()
+                logger.info("Database schema initialized successfully")
+        except Exception as e:
+            logger.error("Failed to initialize database schema: %s", str(e), exc_info=True)
+            raise
+
+    async def store_data(self, symbol: str, data: Dict):
+        """Store market data with compression"""
+        try:
+            compressed_data = self._compressor.compress(orjson.dumps(data))
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    'INSERT INTO market_data (symbol, timestamp, data) VALUES (?, ?, ?)',
+                    (symbol, datetime.now().isoformat(), compressed_data)
+                )
+                await db.commit()
+                logger.debug("Stored data for symbol: %s", symbol)
+        except Exception as e:
+            logger.error("Failed to store data for %s: %s", symbol, str(e), exc_info=True)
+            raise
+
+    async def get_data(self, symbol: str, start_time: Optional[datetime] = None) -> List[Dict]:
+        """Retrieve market data with caching"""
+        try:
+            cache_key = f"{symbol}:{start_time.isoformat() if start_time else 'latest'}"
+            if cache_key in self._cache:
+                logger.debug("Cache hit for %s", cache_key)
+                return self._cache[cache_key]
+
+            query = 'SELECT data FROM market_data WHERE symbol = ?'
+            params = [symbol]
+            
+            if start_time:
+                query += ' AND timestamp >= ?'
+                params.append(start_time.isoformat())
+            
+            query += ' ORDER BY timestamp DESC'
+            
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute(query, params) as cursor:
+                    rows = await cursor.fetchall()
+                    data = [
+                        orjson.loads(self._decompressor.decompress(row[0]))
+                        for row in rows
+                    ]
+                    self._cache[cache_key] = data
+                    logger.debug("Retrieved %d records for %s", len(data), symbol)
+                    return data
+        except Exception as e:
+            logger.error("Failed to retrieve data for %s: %s", symbol, str(e), exc_info=True)
+            return []
+
+    async def cleanup_old_data(self, days: int = 7):
+        """Remove data older than specified days"""
+        try:
+            cutoff_time = (datetime.now() - timedelta(days=days)).isoformat()
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    'DELETE FROM market_data WHERE timestamp < ?',
+                    (cutoff_time,)
+                )
+                deleted = cursor.rowcount
+                await db.commit()
+                logger.info("Cleaned up %d old records", deleted)
+        except Exception as e:
+            logger.error("Failed to cleanup old data: %s", str(e), exc_info=True)
+            raise
+
+    def clear_cache(self):
+        """Clear the data cache"""
+        try:
+            self._cache.clear()
+            logger.info("Cache cleared successfully")
+        except Exception as e:
+            logger.error("Failed to clear cache: %s", str(e), exc_info=True) 

@@ -1,4 +1,3 @@
-import time
 import logging
 from typing import Any, Dict, Optional, TypeVar, Generic
 from cachetools import TTLCache, LRUCache
@@ -6,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import asyncio
 from trading_bot.utils.decorators import error_handler
+from prometheus_client import Counter, Gauge
 
 logger = logging.getLogger(__name__)
 T = TypeVar('T')
@@ -26,11 +26,31 @@ class CacheManager(Generic[T]):
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._locks: Dict[str, asyncio.Lock] = {}
         
+        # Metrics
+        self.stats = {
+            'hits': 0,
+            'misses': 0,
+            'evictions': 0
+        }
+        
+        # Metrics
+        self.metrics = {
+            'cache_hits': Counter('cache_hits_total', 'Number of cache hits'),
+            'cache_misses': Counter('cache_misses_total', 'Number of cache misses'),
+            'cache_size': Gauge('cache_size', 'Current number of items in cache'),
+            'cache_evictions': Counter('cache_evictions_total', 'Number of cache evictions')
+        }
+        
+        logger.info("Initialized cache manager with max_size=%d, ttl=%ds", max_size, ttl)
+        
     async def get(self, key: str) -> Optional[T]:
         """Get value from cache with async support."""
         try:
             # Try TTL cache first
             if key in self.ttl_cache:
+                self.stats['hits'] += 1
+                self.metrics['cache_hits'].inc()
+                logger.debug("Cache hit for key: %s", key)
                 return self.ttl_cache[key]
             
             # Try LRU cache next
@@ -39,12 +59,18 @@ class CacheManager(Generic[T]):
                 # Promote to TTL cache if within memory limits
                 if self._check_memory_usage():
                     self.ttl_cache[key] = value
+                self.stats['hits'] += 1
+                self.metrics['cache_hits'].inc()
+                logger.debug("Cache hit for key: %s", key)
                 return value
                 
+            self.stats['misses'] += 1
+            self.metrics['cache_misses'].inc()
+            logger.debug("Cache miss for key: %s", key)
             return None
             
         except Exception as e:
-            logger.error(f"Error retrieving from cache: {str(e)}")
+            logger.error("Error retrieving from cache: %s", str(e), exc_info=True)
             return None
             
     @error_handler("cache_set")
@@ -63,10 +89,12 @@ class CacheManager(Generic[T]):
                     # Fallback to LRU cache if memory limit reached
                     self.lru_cache[key] = value
                     
+                self.metrics['cache_size'].set(len(self.ttl_cache) + len(self.lru_cache))
+                logger.debug("Cached value for key: %s", key)
                 return True
                 
         except Exception as e:
-            logger.error(f"Error setting cache value: {str(e)}")
+            logger.error("Error setting cache value: %s", str(e), exc_info=True)
             return False
             
     async def delete(self, key: str) -> bool:
@@ -74,9 +102,11 @@ class CacheManager(Generic[T]):
         try:
             self.ttl_cache.pop(key, None)
             self.lru_cache.pop(key, None)
+            self.metrics['cache_size'].set(len(self.ttl_cache) + len(self.lru_cache))
+            logger.debug("Deleted cache key: %s", key)
             return True
         except Exception as e:
-            logger.error(f"Error deleting from cache: {str(e)}")
+            logger.error("Error deleting from cache: %s", str(e), exc_info=True)
             return False
             
     async def clear(self) -> bool:
@@ -84,9 +114,11 @@ class CacheManager(Generic[T]):
         try:
             self.ttl_cache.clear()
             self.lru_cache.clear()
+            self.metrics['cache_size'].set(0)
+            logger.info("Cache cleared")
             return True
         except Exception as e:
-            logger.error(f"Error clearing cache: {str(e)}")
+            logger.error("Error clearing cache: %s", str(e), exc_info=True)
             return False
             
     def _check_memory_usage(self) -> bool:
@@ -123,3 +155,42 @@ class CacheManager(Generic[T]):
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         self._executor.shutdown(wait=False) 
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics"""
+        try:
+            stats = {
+                **self.stats,
+                'size': len(self.ttl_cache) + len(self.lru_cache),
+                'max_size': self.ttl_cache.maxsize,
+                'ttl': self.ttl_cache.ttl
+            }
+            logger.debug("Cache stats: %s", stats)
+            return stats
+            
+        except Exception as e:
+            logger.error("Error getting cache stats: %s", str(e), exc_info=True)
+            return {}
+
+    def cleanup_expired(self) -> int:
+        """
+        Clean up expired cache entries
+        
+        Returns:
+            Number of entries removed
+        """
+        try:
+            initial_size = len(self.ttl_cache) + len(self.lru_cache)
+            self.ttl_cache.expire()
+            self.lru_cache.expire()
+            removed = initial_size - (len(self.ttl_cache) + len(self.lru_cache))
+            
+            if removed > 0:
+                self.metrics['cache_size'].set(len(self.ttl_cache) + len(self.lru_cache))
+                logger.info("Cleaned up %d expired cache entries", removed)
+                
+            return removed
+            
+        except Exception as e:
+            logger.error("Error cleaning up cache: %s", str(e), exc_info=True)
+            return 0 

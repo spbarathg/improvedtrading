@@ -1,7 +1,7 @@
+import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Dict
-import logging
+from typing import Dict, Optional
 from collections import deque
 
 logger = logging.getLogger(__name__)

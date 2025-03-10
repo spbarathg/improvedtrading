@@ -1,15 +1,15 @@
 import asyncio
 import aiohttp
-import logging
+import structlog
 import random
 import time
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import cached_property, partial
-from typing import Any, Dict, List, Optional, Deque, Callable, Awaitable
+from typing import Any, Dict, List, Optional, Deque, Callable, Awaitable, Tuple
 from aiolimiter import AsyncLimiter
-from aiohttp import ClientTimeout, TCPConnector
+from aiohttp import ClientTimeout, TCPConnector, ClientError
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -21,8 +21,25 @@ from tenacity import (
 import orjson
 from trading_bot.data_pipeline.data_storage import DataStorage
 from trading_bot.config import config
+import logging
 
 logger = logging.getLogger(__name__)
+
+class DataFetcherError(Exception):
+    """Base exception class for DataFetcher errors"""
+    pass
+
+class ValidationError(DataFetcherError):
+    """Raised when data validation fails"""
+    pass
+
+class ConnectionError(DataFetcherError):
+    """Raised when connection issues occur"""
+    pass
+
+class CacheError(DataFetcherError):
+    """Raised when cache operations fail"""
+    pass
 
 # Default configuration values
 DEFAULT_MAX_RETRIES = 3
@@ -70,60 +87,92 @@ class CircuitBreaker:
 class DataFetcher:
     _POOL_SIZE = 100
     _TTL_MARGIN = 0.1  # 10% of TTL for cache expiration
+    _MAX_RECONNECT_ATTEMPTS = 3
+    _RECONNECT_DELAY = 5  # seconds
     
-    def __init__(self, data_storage: DataStorage):
+    def __init__(self, config, data_storage: DataStorage):
+        self.config = config
         self.data_storage = data_storage
-        self.cache: Dict[str, Deque[CacheEntry]] = {}
-        self.breakers: Dict[str, CircuitBreaker] = defaultdict(
-            partial(CircuitBreaker, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY * 10)
+        self._cache: Dict[str, CacheEntry] = {}
+        self._circuit_breakers: Dict[str, CircuitBreaker] = defaultdict(
+            lambda: CircuitBreaker()
         )
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.limiter = AsyncLimiter(config.RPC_RATE_LIMIT + config.JUPITER_RATE_LIMIT)
-        self._shutdown = asyncio.Event()
-        self._pending: Deque[asyncio.Task] = deque(maxlen=1000)
-        self.api_endpoints = DEFAULT_API_ENDPOINTS
-        self.solana_rpc_ws = DEFAULT_SOLANA_RPC_WS
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._tasks: List[asyncio.Task] = []
+        self._running = False
+        self._limiter = AsyncLimiter(100, 1)  # 100 requests per second
+        self.last_fetch_time = datetime.now()
+        logger.info("Initializing data fetcher")
 
     async def __aenter__(self):
-        await self.start()
-        return self
+        try:
+            await self.start()
+            return self
+        except Exception as e:
+            logger.exception("Failed to enter context")
+            raise DataFetcherError("Context entry failed") from e
 
-    async def __aexit__(self, *exc):
-        await self.stop()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        try:
+            await self.stop()
+        except Exception as e:
+            logger.exception("Error during context exit")
+            raise DataFetcherError("Context exit failed") from e
 
     @cached_property
-    def connector(self):
-        return TCPConnector(
-            limit=self._POOL_SIZE,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-            force_close=False,
-            use_dns_cache=True,
-            ssl=False
-        )
+    def connector(self) -> TCPConnector:
+        try:
+            return TCPConnector(
+                limit=self._POOL_SIZE,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True
+            )
+        except Exception as e:
+            logger.exception("Failed to create TCP connector")
+            raise ConnectionError("Failed to create connector") from e
 
     async def start(self):
-        self.session = aiohttp.ClientSession(
-            connector=self.connector,
-            timeout=ClientTimeout(total=30, connect=10),
-            json_serialize=orjson.dumps,
-            headers={'User-Agent': 'TradingBot/2.0'},
-            auto_decompress=True
-        )
-        asyncio.create_task(self._monitor_tasks())
+        try:
+            if self._running:
+                logger.warning("DataFetcher is already running")
+                return
+
+            self._session = aiohttp.ClientSession(
+                connector=self.connector,
+                timeout=ClientTimeout(total=30),
+                json_serialize=orjson.dumps
+            )
+            self._running = True
+            self._tasks.append(asyncio.create_task(self._monitor_tasks()))
+            logger.info("DataFetcher started successfully")
+        except Exception as e:
+            logger.exception("Failed to start DataFetcher")
+            raise DataFetcherError("Start operation failed") from e
 
     async def stop(self):
-        self._shutdown.set()
-        await self._cancel_pending()
-        if self.session:
-            await self.session.close()
-        self.connector.close()
+        try:
+            self._running = False
+            await self._cancel_pending()
+            
+            if self._session and not self._session.closed:
+                await self._session.close()
+            
+            if self._ws and not self._ws.closed:
+                await self._ws.close()
+
+            self._session = None
+            self._ws = None
+            logger.info("DataFetcher stopped successfully")
+        except Exception as e:
+            logger.exception("Error during DataFetcher shutdown")
+            raise DataFetcherError("Stop operation failed") from e
 
     async def _monitor_tasks(self):
-        while not self._shutdown.is_set():
+        while self._running:
             try:
-                while self._pending and self._pending[0].done():
-                    task = self._pending.popleft()
+                while self._tasks and self._tasks[0].done():
+                    task = self._tasks.pop(0)
                     if task.exception():
                         logger.error("Task failed: %s", task.exception())
                 await asyncio.sleep(1)
@@ -131,88 +180,187 @@ class DataFetcher:
                 logger.error("Monitor error: %s", e)
 
     async def _cancel_pending(self):
-        for task in self._pending:
+        for task in self._tasks:
             task.cancel()
-        await asyncio.gather(*self._pending, return_exceptions=True)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    @retry(
-        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
-        stop=stop_after_attempt(DEFAULT_MAX_RETRIES),
-        wait=wait_exponential_jitter(max=60),
-        before=before_log(logger, logging.DEBUG),
-        after=after_log(logger, logging.DEBUG)
-    )
     async def fetch(self, endpoint: str, *, 
                    path: str = "",
                    params: Optional[Dict] = None,
-                   validator: Optional[Callable] = None) -> Any:
-        """Generic fetch method with circuit breaking and validation"""
-        if self.breakers[endpoint].is_open():
-            raise RuntimeError(f"Circuit open for {endpoint}")
+                   validator: Optional[Callable] = None) -> Tuple[Any, bool]:
+        """
+        Fetch data from an endpoint with comprehensive error handling
+        Returns: Tuple[data, success_flag]
+        """
+        if not self._session:
+            raise ConnectionError("Session not initialized")
 
-        url = f"{self.api_endpoints[endpoint]}/{path}"
-        async with self.limiter:
-            try:
-                async with self.session.get(url, params=params) as resp:
-                    data = await resp.json(loads=orjson.loads)
+        circuit_breaker = self._circuit_breakers[endpoint]
+        if circuit_breaker.is_open():
+            logger.warning(f"Circuit breaker open for endpoint: {endpoint}")
+            return None, False
+
+        try:
+            async with self._limiter:
+                url = f"{endpoint}/{path}".rstrip('/')
+                async with self._session.get(url, params=params) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+
                     if validator and not validator(data):
-                        raise ValueError("Validation failed")
-                    self.breakers[endpoint].record_success()
-                    Metrics.increment("fetch.success", {"endpoint": endpoint})
-                    return data
-            except Exception as e:
-                self.breakers[endpoint].record_failure()
-                Metrics.increment("fetch.error", {"endpoint": endpoint})
-                logger.error("Fetch error: %s", e, exc_info=True)
-                raise
+                        raise ValidationError(f"Data validation failed for {url}")
 
-    async def fetch_market_data(self, symbol: str) -> Optional[Dict]:
-        """Optimized market data fetcher with cache stampede prevention"""
-        cache_key = f"market:{symbol}"
-        if entry := self._get_cache(cache_key):
-            Metrics.increment("cache.hit", {"type": "market"})
-            return entry.data
+                    circuit_breaker.record_success()
+                    return data, True
 
-        Metrics.increment("cache.miss", {"type": "market"})
-        data = await self.fetch("jupiter", path="quote", params={
-            "inputMint": symbol,
-            "outputMint": "SOL",
-            "amount": 1000000000
-        }, validator=self.validate_market_data)
+        except ClientError as e:
+            circuit_breaker.record_failure()
+            logger.error(f"HTTP error for {endpoint}: {str(e)}", exc_info=True)
+            return None, False
+        except asyncio.TimeoutError:
+            circuit_breaker.record_failure()
+            logger.error(f"Timeout while fetching from {endpoint}", exc_info=True)
+            return None, False
+        except ValidationError as e:
+            circuit_breaker.record_failure()
+            logger.error(f"Validation error for {endpoint}: {str(e)}", exc_info=True)
+            return None, False
+        except Exception as e:
+            circuit_breaker.record_failure()
+            logger.exception(f"Unexpected error fetching from {endpoint}")
+            return None, False
 
-        if data:
-            self._set_cache(cache_key, data, config.CACHE_TTL)
-            await self.data_storage.store("market_data", data)
-        return data
+    async def fetch_market_data(self) -> Optional[Dict]:
+        """Fetch current market data for configured trading pairs"""
+        try:
+            if not self._session or self._session.closed:
+                await self.start()
+
+            market_data = {}
+            for pair in self.config.TRADING_PAIRS:
+                try:
+                    async with self._session.get(f"/quote/{pair}") as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            market_data[pair] = self._process_market_data(data)
+                            logger.debug(f"Fetched market data for {pair}: {market_data[pair]}")
+                        else:
+                            logger.warning(f"Failed to fetch market data for {pair}: Status {response.status}")
+                except Exception as e:
+                    logger.error(f"Error fetching market data for {pair}: {str(e)}", exc_info=True)
+
+            if market_data:
+                await self.data_storage.store_market_data(market_data)
+                logger.info(f"Successfully fetched and stored market data for {len(market_data)} pairs")
+                return market_data
+            else:
+                logger.warning("No market data was fetched")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error in fetch_market_data: {str(e)}", exc_info=True)
+            return None
+
+    def _process_market_data(self, raw_data: Dict) -> Dict:
+        """Process raw market data into standardized format"""
+        try:
+            processed_data = {
+                'timestamp': datetime.now().isoformat(),
+                'price': float(raw_data['price']),
+                'volume': float(raw_data.get('volume', 0)),
+                'bid': float(raw_data.get('bid', 0)),
+                'ask': float(raw_data.get('ask', 0)),
+                'high': float(raw_data.get('high', 0)),
+                'low': float(raw_data.get('low', 0))
+            }
+            logger.debug(f"Processed market data: {processed_data}")
+            return processed_data
+        except Exception as e:
+            logger.error(f"Error processing market data: {str(e)}", exc_info=True)
+            return {}
+
+    async def fetch_historical_data(self, pair: str, timeframe: str = '1h', limit: int = 1000) -> Optional[List[Dict]]:
+        """Fetch historical market data"""
+        try:
+            if not self._session or self._session.closed:
+                await self.start()
+
+            logger.info(f"Fetching historical data for {pair} ({timeframe} timeframe, {limit} candles)")
+            async with self._session.get(f"/history/{pair}", params={'timeframe': timeframe, 'limit': limit}) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    processed_data = [self._process_market_data(candle) for candle in data]
+                    await self.data_storage.store_historical_data(pair, processed_data)
+                    logger.info(f"Successfully fetched and stored {len(processed_data)} historical candles for {pair}")
+                    return processed_data
+                else:
+                    logger.warning(f"Failed to fetch historical data for {pair}: Status {response.status}")
+                    return None
+
+        except Exception as e:
+            logger.error(f"Error fetching historical data for {pair}: {str(e)}", exc_info=True)
+            return None
+
+    async def fetch_orderbook(self, pair: str) -> Optional[Dict]:
+        """Fetch current orderbook data"""
+        try:
+            if not self._session or self._session.closed:
+                await self.start()
+
+            logger.info(f"Fetching orderbook for {pair}")
+            async with self._session.get(f"/orderbook/{pair}") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    processed_data = {
+                        'timestamp': datetime.now().isoformat(),
+                        'bids': data.get('bids', []),
+                        'asks': data.get('asks', [])
+                    }
+                    await self.data_storage.store_orderbook(pair, processed_data)
+                    logger.info(f"Successfully fetched and stored orderbook for {pair}")
+                    return processed_data
+                else:
+                    logger.warning(f"Failed to fetch orderbook for {pair}: Status {response.status}")
+                    return None
+
+        except Exception as e:
+            logger.error(f"Error fetching orderbook for {pair}: {str(e)}", exc_info=True)
+            return None
 
     def _get_cache(self, key: str) -> Optional[CacheEntry]:
-        """LFU cache implementation with TTL"""
-        now = time.monotonic()
-        if key not in self.cache:
-            return None
+        try:
+            entry = self._cache.get(key)
+            if not entry:
+                return None
 
-        entries = sorted(
-            [entry for entry in self.cache[key] if entry.expires_at > now],
-            key=lambda e: (-e.access_count, e.expires_at)
-        )
-        if not entries:
-            del self.cache[key]
-            return None
+            if time.time() > entry.expires_at:
+                del self._cache[key]
+                return None
 
-        entries[0].access_count += 1
-        return entries[0]
+            entry.access_count += 1
+            return entry
+
+        except Exception as e:
+            logger.error(f"Cache retrieval error for key {key}: {str(e)}", exc_info=True)
+            raise CacheError(f"Failed to get cache entry: {str(e)}") from e
 
     def _set_cache(self, key: str, data: Any, ttl: int):
-        """Set cache with probabilistic early expiration"""
-        expires = time.monotonic() + ttl * (1 - self._TTL_MARGIN + random.uniform(0, 2 * self._TTL_MARGIN))
-        entry = CacheEntry(data=data, expires_at=expires)
-        self.cache.setdefault(key, deque(maxlen=config.CACHE_SIZE)).append(entry)
+        try:
+            expires_at = time.time() + (ttl * (1 - self._TTL_MARGIN))
+            self._cache[key] = CacheEntry(data=data, expires_at=expires_at)
+        except Exception as e:
+            logger.error(f"Cache set error for key {key}: {str(e)}", exc_info=True)
+            raise CacheError(f"Failed to set cache entry: {str(e)}") from e
 
     @staticmethod
     def validate_market_data(data: Dict) -> bool:
-        """Fast validation using set theory"""
-        required = {"price", "amount", "route"}
-        return required.issubset(data) and all(isinstance(data[k], (int, float)) for k in required)
+        try:
+            return isinstance(data, dict) and all(
+                isinstance(v, (int, float)) for v in data.values()
+            )
+        except Exception as e:
+            logger.error(f"Market data validation error: {str(e)}", exc_info=True)
+            return False
 
     async def batch_process(self, processor: Callable[[Any], Awaitable[Any]], items: List[Any]):
         """Parallel batch processing with backpressure"""
@@ -223,15 +371,38 @@ class DataFetcher:
         return await asyncio.gather(*(_process(i) for i in items), return_exceptions=True)
 
     async def stream_solana_transactions(self):
-        """WebSocket streamer with reconnect logic"""
-        while not self._shutdown.is_set():
+        reconnect_attempts = 0
+        while self._running and reconnect_attempts < self._MAX_RECONNECT_ATTEMPTS:
             try:
-                async with self.session.ws_connect(self.solana_rpc_ws) as ws:
+                if not self._session:
+                    raise ConnectionError("Session not initialized")
+
+                async with self._session.ws_connect(DEFAULT_SOLANA_RPC_WS) as ws:
+                    self._ws = ws
+                    logger.info("Connected to Solana WebSocket")
+                    reconnect_attempts = 0  # Reset counter on successful connection
+
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = orjson.loads(msg.data)
-                            await self.data_storage.store("solana_tx", data)
-                            Metrics.increment("ws.message")
+                            try:
+                                data = orjson.loads(msg.data)
+                                await self.data_storage.store_transaction(data)
+                            except Exception as e:
+                                logger.error(f"Failed to process message: {str(e)}", exc_info=True)
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+
+            except (ClientError, asyncio.TimeoutError) as e:
+                reconnect_attempts += 1
+                logger.error(
+                    f"WebSocket connection error (attempt {reconnect_attempts}/{self._MAX_RECONNECT_ATTEMPTS}): {str(e)}",
+                    exc_info=True
+                )
+                if reconnect_attempts < self._MAX_RECONNECT_ATTEMPTS:
+                    await asyncio.sleep(self._RECONNECT_DELAY * reconnect_attempts)
             except Exception as e:
-                logger.error("WebSocket error: %s", e)
-                await asyncio.sleep(random.uniform(1, 5))
+                logger.exception("Unexpected error in Solana transaction stream")
+                break
+
+        if reconnect_attempts >= self._MAX_RECONNECT_ATTEMPTS:
+            logger.error("Max reconnection attempts reached for Solana WebSocket")
